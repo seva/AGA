@@ -2,8 +2,8 @@
 // @name         AGA Browser-Side Controller
 // @namespace    http://tampermonkey.net/
 // @version      1.5
-// @description  Extracts AGA:: commands from Gemini's output after network events. Uses GM_log only.
-// @author       AGA Developer
+// @description  Extracts AGA:: commands from Gemini's output after network events.
+// @author       Swearlock
 // @match        https://gemini.google.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_log
