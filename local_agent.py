@@ -58,11 +58,11 @@ if __name__ == "__main__":
     # It's good practice to make host and port configurable,
     # but for simplicity, we'll hardcode them here.
     # The Local Agent listens on localhost only.
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="127.0.0.1", port=3000)
 
 # To run this:
 # 1. Make sure you have fastapi and uvicorn installed:
 #    pip install fastapi "uvicorn[standard]"
 # 2. Run the script:
 #    python main.py
-# The server will be available at http://127.0.0.1:8000
+# The server will be available at http://127.0.0.1:3000
