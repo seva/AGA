@@ -14,7 +14,7 @@ class CommandResponse(BaseModel):
     return_code: int
     command: str
 
-@app.post("/execute-command", response_model=CommandResponse)
+@app.post("/command", response_model=CommandResponse)
 async def execute_command(request: CommandRequest):
     """
     Executes a shell command and returns its output.
