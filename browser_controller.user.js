@@ -190,59 +190,88 @@
         }
 
         const trimmedText = text.trim();
-        const commandPrefixIndex = trimmedText.lastIndexOf(COMMAND_PREFIX);
+        const COMMAND_PREFIX_LENGTH = COMMAND_PREFIX.length; // Cache length
 
-        // Guard Clause: Check if COMMAND_PREFIX exists and has content after it
-        if (commandPrefixIndex === -1 || commandPrefixIndex + COMMAND_PREFIX.length >= trimmedText.length) {
-            return;
+        let indices = [];
+        let currentIndex = trimmedText.indexOf(COMMAND_PREFIX);
+        while (currentIndex !== -1) {
+            indices.push(currentIndex);
+            currentIndex = trimmedText.indexOf(COMMAND_PREFIX, currentIndex + 1);
         }
 
-        const potentialJsonString = trimmedText.substring(commandPrefixIndex + COMMAND_PREFIX.length);
-        if (!potentialJsonString) {
-            return;
+        if (indices.length === 0) {
+            return; // No AGA:: prefix found
         }
 
-        let parsedPayload;
-        try {
-            parsedPayload = JSON.parse(potentialJsonString);
-        } catch (e) {
-            const trimmedPotential = potentialJsonString.trim();
-            // Heuristic: Only show JSON.parse error in UI if it looks like an attempt at a JSON object.
-            if (trimmedPotential.startsWith('{') && trimmedPotential.endsWith('}') && trimmedPotential.includes(':') && trimmedPotential.includes('command')) {
-                GM_log('AGA Controller: Failed to parse likely JSON object: "' + potentialJsonString + '". Error: ' + e);
-                const errorMessage = "AGA Error: Malformed JSON detected in your command.\nDetails: " + e.message + "\nProblematic JSON string: " + potentialJsonString.substring(0, 100) + (potentialJsonString.length > 100 ? "..." : "");
-                showSpinner();
-                await injectTextAndClickSend(errorMessage);
-                hideSpinner();
-            } else {
-                // Not a clear attempt at JSON object, fail silently in UI, but log for debugging.
-                GM_log('AGA Controller: Failed to parse text after AGA:: as JSON (not an obvious JSON object attempt): "' + potentialJsonString + '". Error: ' + e);
+        let firstHeuristicParseError = null;
+        let firstHeuristicParseErrorJsonString = "";
+        let uiFeedbackMessage = null; // To store the single message for UI feedback
+
+        // Iterate from the last found AGA:: prefix backwards to the first
+        for (let i = indices.length - 1; i >= 0; i--) {
+            const commandStartIndex = indices[i];
+            // The potential JSON string starts after "AGA::" and goes to the end of the trimmedText
+            const potentialJsonString = trimmedText.substring(commandStartIndex + COMMAND_PREFIX_LENGTH);
+            const trimmedPotentialAttempt = potentialJsonString.trim();
+            
+            if (!trimmedPotentialAttempt) { // If only whitespace (or empty) after AGA::
+                GM_log('AGA Controller: Empty string after AGA:: at index ' + commandStartIndex + '. Skipping.');
+                continue; // Try the next earlier AGA:: prefix
             }
-            return; 
+
+            let parsedPayload;
+            try {
+                parsedPayload = JSON.parse(trimmedPotentialAttempt);
+            } catch (e) {
+                // Heuristic: Only consider for UI error if it looks like an attempt at a JSON object.
+                const isLikelyJson = trimmedPotentialAttempt.startsWith('{') && 
+                                    trimmedPotentialAttempt.endsWith('}') && 
+                                    trimmedPotentialAttempt.includes('command') && 
+                                    trimmedPotentialAttempt.includes(':');
+
+                if (isLikelyJson) {
+                    GM_log('AGA Controller: Failed to parse LIKELY JSON object starting after AGA:: at index ' + commandStartIndex + ': "' + trimmedPotentialAttempt.substring(0, 200) + '". Error: ' + e);
+                    if (!firstHeuristicParseError) { // Store the first such error encountered
+                        firstHeuristicParseError = e;
+                        firstHeuristicParseErrorJsonString = trimmedPotentialAttempt;
+                    }
+                } else {
+                    GM_log('AGA Controller: Failed to parse text after AGA:: (at index ' + commandStartIndex + ') as JSON (not an obvious JSON object attempt): '+ trimmedPotentialAttempt.substring(0,200) + '. Error: ' + e);
+                }
+                continue; // Try the next earlier AGA:: prefix
+            }
+
+            // Successfully parsed JSON, now validate structure
+            // Silently ignore (in UI) if command field is missing or not a string.
+            if (!parsedPayload || typeof parsedPayload.command !== 'string') {
+                GM_log('AGA Controller: Parsed JSON (from AGA:: at index ' + commandStartIndex + '), but \'command\' field is missing or not a string. Payload: ' + JSON.stringify(parsedPayload) + '. Original: ' + trimmedPotentialAttempt);
+                continue; // Try the next earlier AGA:: prefix
+            }
+
+            // Handle optional stdin: if present, must be a string; if absent, defaults to ""
+            if (parsedPayload.stdin === undefined) {
+                parsedPayload.stdin = "";
+            } else if (typeof parsedPayload.stdin !== 'string') {
+                GM_log('AGA Controller: Parsed JSON (from AGA:: at index ' + commandStartIndex + '), command is valid, but stdin is present and not a string: ' + trimmedPotentialAttempt);
+                continue; // Try the next earlier AGA:: prefix
+            }
+
+            GM_log('AGA Controller: Valid command payload extracted from AGA:: at index ' + commandStartIndex + ': ' + JSON.stringify(parsedPayload));
+            sendCommandToAgent(parsedPayload); // This function handles its own spinner for agent communication
+            return; // Command found and sent, stop processing further AGA:: occurrences
         }
 
-        // Successfully parsed JSON, now validate structure
-        // Silently ignore (in UI) if command field is missing or not a string.
-        if (!parsedPayload || typeof parsedPayload.command !== 'string') {
-            GM_log('AGA Controller: Parsed JSON, but \'command\' field is missing or not a string. Payload: ' + JSON.stringify(parsedPayload) + '. Original: ' + potentialJsonString);
-            // No UI error for this specific case as per request.
-            return;
-        }
-
-        // Handle optional stdin: if present, must be a string; if absent, defaults to ""
-        if (parsedPayload.stdin === undefined) {
-            parsedPayload.stdin = "";
-        } else if (typeof parsedPayload.stdin !== 'string') {
-            GM_log('AGA Controller: Parsed JSON, command is valid, but stdin is present and not a string: ' + potentialJsonString);
-            const errorMsg = "AGA Error: Parsed JSON is invalid. \'stdin\' field, if present, must be a string. Received: " + potentialJsonString.substring(0,150);
+        // If the loop completes, no valid command was sent.
+        if (firstHeuristicParseError) {
+            // No specific stdin error, but a general heuristic parse error was found
+            const errorMessage = "AGA Error: Malformed JSON detected in your command.\\nDetails: " + firstHeuristicParseError.message + 
+                                 "\\nProblematic JSON string: " + firstHeuristicParseErrorJsonString.substring(0, 100) + 
+                                 (firstHeuristicParseErrorJsonString.length > 100 ? "..." : "");
             showSpinner();
-            await injectTextAndClickSend(errorMsg);
+            await injectTextAndClickSend(errorMessage);
             hideSpinner();
-            return;
         }
-
-        GM_log('AGA Controller: Valid command payload extracted: ' + JSON.stringify(parsedPayload));
-        sendCommandToAgent(parsedPayload); // This function handles its own spinner for agent communication
+        // If no command sent and no UI-worthy error stored, function exits silently.
     }
 
     async function handlePotentialCommandEvent(event) { // Made async
