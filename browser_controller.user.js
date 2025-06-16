@@ -1,8 +1,8 @@
 ﻿// ==UserScript==
 // @name         AGA Browser-Side Controller
 // @namespace    http://tampermonkey.net/
-// @version      2.5
-// @description  Refactored with Guard Clauses, injects JSON parse errors back to UI.
+// @version      2.8
+// @description  Smarter JSON parsing error feedback; silent UI for missing/invalid command field.
 // @author       AGA Developer
 // @match        https://gemini.google.com/*
 // @grant        GM_xmlhttpRequest
@@ -13,6 +13,7 @@
 (function() {
     'use strict';
 
+    // --- Constants and Selectors ---
     const COMMAND_PREFIX = "AGA::";
     const AGENT_URL = "http://localhost:3000/command";
 
@@ -35,34 +36,62 @@
     const CALM_DOWN_DURATION_MS = 2000;
 
     // --- Spinner Elements and Functions ---
-    const SPINNER_HTML = `
-    <div id="aga-spinner" style="position: absolute; width: 24px; height: 24px; top: 10px; right: 10px; display: none;">
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-            <circle cx="12" cy="12" r="10" />
-            <path d="M12 2v4M12 18v4M4.22 4.22l2.83 2.83M16.97 16.97l2.83 2.83M2 12h4m14 0h4m-2.83-7.76l-2.83 2.83M4.22 16.97l2.83-2.83" />
-        </svg>
-    </div>
-    `;
+    let spinnerElement = null; // Keep a reference to the spinner element
+
+    function createSpinnerElement() {
+        const svgNS = "http://www.w3.org/2000/svg";
+        const spinnerDiv = document.createElement('div');
+        spinnerDiv.setAttribute('id', 'aga-spinner');
+        spinnerDiv.style.position = 'fixed';
+        spinnerDiv.style.width = '24px';
+        spinnerDiv.style.height = '24px';
+        spinnerDiv.style.top = '10px';
+        spinnerDiv.style.right = '10px';
+        spinnerDiv.style.display = 'none';
+        spinnerDiv.style.zIndex = '9999';
+
+        const svg = document.createElementNS(svgNS, 'svg');
+        svg.setAttribute('viewBox', '0 0 24 24');
+        svg.setAttribute('fill', 'none');
+        svg.setAttribute('stroke', 'currentColor');
+        svg.setAttribute('stroke-width', '2');
+        svg.setAttribute('stroke-linecap', 'round');
+        svg.setAttribute('stroke-linejoin', 'round');
+
+        const circle = document.createElementNS(svgNS, 'circle');
+        circle.setAttribute('cx', '12');
+        circle.setAttribute('cy', '12');
+        circle.setAttribute('r', '10');
+
+        const path = document.createElementNS(svgNS, 'path');
+        path.setAttribute('d', 'M12 2v4M12 18v4M4.22 4.22l2.83 2.83M16.97 16.97l2.83 2.83M2 12h4m14 0h4m-2.83-7.76l-2.83 2.83M4.22 16.97l2.83-2.83');
+
+        svg.appendChild(circle);
+        svg.appendChild(path);
+        spinnerDiv.appendChild(svg);
+        return spinnerDiv;
+    }
 
     function showSpinner() {
-        const spinnerContainer = document.createElement('div');
-        spinnerContainer.innerHTML = SPINNER_HTML;
-        document.body.appendChild(spinnerContainer);
-        const spinner = document.getElementById('aga-spinner');
-        if (spinner) {
-            spinner.style.display = 'block';
+        if (!spinnerElement) {
+            spinnerElement = createSpinnerElement();
+            document.body.appendChild(spinnerElement);
+        }
+        if (spinnerElement) {
+            GM_log("AGA Controller: Showing spinner.");
+            spinnerElement.style.display = 'block';
         }
     }
 
     function hideSpinner() {
-        const spinner = document.getElementById('aga-spinner');
-        if (spinner) {
-            spinner.style.display = 'none';
+        if (spinnerElement) {
+            GM_log("AGA Controller: Hiding spinner.");
+            spinnerElement.style.display = 'none';
         }
     }
     // --- End of Spinner Functions ---
 
-    GM_log("AGA Controller: Script loaded (v2.5 - JSON error feedback. Agent URL: " + AGENT_URL + ").");
+    GM_log("AGA Controller: Script loaded (v2.8 - Heuristic JSON error UI. Agent URL: " + AGENT_URL + ").");
 
     // --- Reusable UI Injection Function ---
     async function injectTextAndClickSend(textToInject) {
@@ -121,6 +150,7 @@
             return;
         }
 
+        showSpinner(); // Show spinner before sending command
         const dataToSend = JSON.stringify(commandPayload);
         GM_log('AGA Controller: Preparing to send command object to Agent: ' + dataToSend);
         GM_log('AGA Controller: Sending to Agent (' + AGENT_URL + '): ' + dataToSend);
@@ -136,21 +166,24 @@
                     const responseData = JSON.parse(response.responseText);
                     GM_log("AGA Controller: Agent responded: " + JSON.stringify(responseData));
                     const formattedResponse = JSON.stringify(responseData, null, 2);
-                    injectTextAndClickSend(formattedResponse);
+                    await injectTextAndClickSend(formattedResponse);
                 } catch (e) {
                     GM_log('AGA Controller: Error parsing Agent response: ' + e + '. Text: ' + response.responseText);
-                    injectTextAndClickSend("AGA Error: Could not parse response from Local Agent. Raw response: " + response.responseText.substring(0, 200));
+                    await injectTextAndClickSend("AGA Error: Could not parse response from Local Agent. Raw response: " + response.responseText.substring(0, 200));
+                } finally {
+                    hideSpinner(); // Hide spinner after operation completes or fails
                 }
             },
-            onerror: function(response) {
+            onerror: async function(response) { // Make onerror async
                 GM_log('AGA Controller: Error sending to Agent. Status: ' + response.status);
-                injectTextAndClickSend("AGA Error: Failed to send command to Local Agent. Status: " + response.status);
+                await injectTextAndClickSend("AGA Error: Failed to send command to Local Agent. Status: " + response.status);
+                hideSpinner(); // Hide spinner after error handling
             }
         });
     }
 
     // --- DOM Scraping Command Logic ---
-    function checkForCommandsInTextAndSend(text) {
+    async function checkForCommandsInTextAndSend(text) { // Made async
         // Guard Clause: Ensure text is a non-empty string
         if (!text || typeof text !== 'string') {
             return;
@@ -173,17 +206,26 @@
         try {
             parsedPayload = JSON.parse(potentialJsonString);
         } catch (e) {
-            GM_log('AGA Controller: Failed to parse JSON command part: "' + potentialJsonString + '". Error: ' + e);
-            const errorMessage = "AGA Error: Malformed JSON detected in your command.\nDetails: " + e.message + "\nProblematic JSON string: " + potentialJsonString.substring(0, 100) + (potentialJsonString.length > 100 ? "..." : "");
-            injectTextAndClickSend(errorMessage);
-            return; // Exit if JSON parsing fails
+            const trimmedPotential = potentialJsonString.trim();
+            // Heuristic: Only show JSON.parse error in UI if it looks like an attempt at a JSON object.
+            if (trimmedPotential.startsWith('{') && trimmedPotential.endsWith('}') && trimmedPotential.includes(':') && trimmedPotential.includes('command')) {
+                GM_log('AGA Controller: Failed to parse likely JSON object: "' + potentialJsonString + '". Error: ' + e);
+                const errorMessage = "AGA Error: Malformed JSON detected in your command.\nDetails: " + e.message + "\nProblematic JSON string: " + potentialJsonString.substring(0, 100) + (potentialJsonString.length > 100 ? "..." : "");
+                showSpinner();
+                await injectTextAndClickSend(errorMessage);
+                hideSpinner();
+            } else {
+                // Not a clear attempt at JSON object, fail silently in UI, but log for debugging.
+                GM_log('AGA Controller: Failed to parse text after AGA:: as JSON (not an obvious JSON object attempt): "' + potentialJsonString + '". Error: ' + e);
+            }
+            return; 
         }
 
-        // Guard Clause: Validate the structure of the parsed JSON object (command is required)
+        // Successfully parsed JSON, now validate structure
+        // Silently ignore (in UI) if command field is missing or not a string.
         if (!parsedPayload || typeof parsedPayload.command !== 'string') {
-            GM_log('AGA Controller: Parsed JSON, but command is missing or not a string: ' + potentialJsonString);
-            const errorMsg = "AGA Error: Parsed JSON is invalid. \'command\' field is missing or not a string. Received: " + potentialJsonString.substring(0,150);
-            injectTextAndClickSend(errorMsg);
+            GM_log('AGA Controller: Parsed JSON, but \'command\' field is missing or not a string. Payload: ' + JSON.stringify(parsedPayload) + '. Original: ' + potentialJsonString);
+            // No UI error for this specific case as per request.
             return;
         }
 
@@ -193,22 +235,24 @@
         } else if (typeof parsedPayload.stdin !== 'string') {
             GM_log('AGA Controller: Parsed JSON, command is valid, but stdin is present and not a string: ' + potentialJsonString);
             const errorMsg = "AGA Error: Parsed JSON is invalid. \'stdin\' field, if present, must be a string. Received: " + potentialJsonString.substring(0,150);
-            injectTextAndClickSend(errorMsg);
+            showSpinner();
+            await injectTextAndClickSend(errorMsg);
+            hideSpinner();
             return;
         }
 
         GM_log('AGA Controller: Valid command payload extracted: ' + JSON.stringify(parsedPayload));
-        sendCommandToAgent(parsedPayload);
+        sendCommandToAgent(parsedPayload); // This function handles its own spinner for agent communication
     }
 
-    function handlePotentialCommandEvent(event) {
+    async function handlePotentialCommandEvent(event) { // Made async
         // Guard Clause: Validate event and event.detail.text
         if (!event || !event.detail || typeof event.detail.text !== 'string') {
             GM_log('AGA Controller: Invalid ' + AGA_POTENTIAL_COMMAND_EVENT + '.');
             return;
         }
         GM_log('AGA Controller: Received ' + AGA_POTENTIAL_COMMAND_EVENT + ' with text: "' + event.detail.text.substring(0,100) + '..."');
-        checkForCommandsInTextAndSend(event.detail.text);
+        await checkForCommandsInTextAndSend(event.detail.text); // Await if it involves UI feedback for errors
     }
 
     document.addEventListener(AGA_POTENTIAL_COMMAND_EVENT, handlePotentialCommandEvent);
@@ -348,6 +392,6 @@
     };
 
     // --- Initialization ---
-    GM_log("AGA Controller (v2.5): Network interceptors initialized. Agent URL: " + AGENT_URL);
+    GM_log("AGA Controller (v2.8): Network interceptors initialized. Agent URL: " + AGENT_URL);
 
 })();
