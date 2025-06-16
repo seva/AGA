@@ -1,8 +1,8 @@
-// ==UserScript==
+﻿// ==UserScript==
 // @name         AGA Browser-Side Controller
 // @namespace    http://tampermonkey.net/
-// @version      2.3
-// @description  Adds calm down period after RegenerateIcon to avoid immediate re-trigger by BatchExecute.
+// @version      2.5
+// @description  Refactored with Guard Clauses, injects JSON parse errors back to UI.
 // @author       AGA Developer
 // @match        https://gemini.google.com/*
 // @grant        GM_xmlhttpRequest
@@ -17,12 +17,12 @@
     const AGENT_URL = "http://localhost:3000/command";
 
     // --- Network Interception URL Substrings (for infix matching) ---
-    const STREAM_GENERATE_URL_SUBSTRING = "/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate"; // More specific substring
-    const REGENERATE_ICON_URL_SUBSTRING = "/lamda/images/regenerate"; // More specific substring
-    const BATCH_EXECUTE_URL_SUBSTRING = "/BardChatUi/data/batchexecute"; // More specific substring
+    const STREAM_GENERATE_URL_SUBSTRING = "/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
+    const REGENERATE_ICON_URL_SUBSTRING = "/lamda/images/regenerate";
+    const BATCH_EXECUTE_URL_SUBSTRING = "/BardChatUi/data/batchexecute";
 
     // --- Constants for DOM Scraping Logic ---
-    const AGA_POTENTIAL_COMMAND_EVENT = "AgaPotentialCommandEvent"; // Custom event name
+    const AGA_POTENTIAL_COMMAND_EVENT = "AgaPotentialCommandEvent";
     const MESSAGE_CONTENT_SELECTOR = "message-content";
 
     // --- Selectors for Injecting Agent Response ---
@@ -32,7 +32,7 @@
     // --- State variable for network flow ---
     let isWaitingForRegenerateIconResponse = false;
     let isCalmDownPeriodActive = false;
-    const CALM_DOWN_DURATION_MS = 2000; // 2 seconds, adjust as needed
+    const CALM_DOWN_DURATION_MS = 2000;
 
     // --- Spinner Elements and Functions ---
     const SPINNER_HTML = `
@@ -62,108 +62,152 @@
     }
     // --- End of Spinner Functions ---
 
-    GM_log("AGA Controller: Script loaded (v2.3 - Calm Down Period. Agent URL: " + AGENT_URL + ").");
+    GM_log("AGA Controller: Script loaded (v2.5 - JSON error feedback. Agent URL: " + AGENT_URL + ").");
 
-    // --- Unified Agent Communication Function ---
-    function sendCommandToAgent(commandTextOrSystemSignal) {
-        if (!commandTextOrSystemSignal || typeof commandTextOrSystemSignal !== 'string' || commandTextOrSystemSignal.trim() === '') {
-            GM_log("AGA Controller: Invalid command/signal provided to sendCommandToAgent.");
+    // --- Reusable UI Injection Function ---
+    async function injectTextAndClickSend(textToInject) {
+        const editorElement = document.querySelector(GEMINI_RESPONSE_INPUT_EDITOR_SELECTOR);
+        if (!editorElement) {
+            GM_log("AGA Controller: Editor element not found with selector: " + GEMINI_RESPONSE_INPUT_EDITOR_SELECTOR);
             return;
         }
-        GM_log(`AGA Controller: Sending to Agent (${AGENT_URL}): ${commandTextOrSystemSignal}`);
+
+        GM_log('AGA Controller: Attempting to inject text into editor: "' + String(textToInject).substring(0,100) + '..."');
+        // Ensure textToInject is a string, especially if it's an error object.
+        editorElement.innerText = String(textToInject);
+        await new Promise(resolve => setTimeout(resolve, 200)); // Increased delay
+
+        // Dispatch input events to help frameworks recognize the change
+        editorElement.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+        editorElement.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+        await new Promise(resolve => setTimeout(resolve, 100)); // Increased delay
+
+        const sendButtonElement = document.querySelector(GEMINI_RESPONSE_SEND_BUTTON_SELECTOR);
+        if (!sendButtonElement) {
+            GM_log("AGA Controller: Send button not found with selector: " + GEMINI_RESPONSE_SEND_BUTTON_SELECTOR + ". Cannot click send.");
+            return;
+        }
+        
+        GM_log('AGA Controller: Send button state before click: disabled=' + sendButtonElement.disabled + ', outerHTML=' + sendButtonElement.outerHTML.substring(0,150));
+        GM_log("AGA Controller: Attempting to simulate hover and click send button programmatically.");
+
+        // WAIT before CLICKING
+        await new Promise(resolve => setTimeout(resolve, 1000)); // Adjusted wait time
+
+        // Simulate hover
+        sendButtonElement.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true }));
+        await new Promise(resolve => setTimeout(resolve, 100)); 
+        sendButtonElement.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+        await new Promise(resolve => setTimeout(resolve, 200)); 
+
+        // Simulate click sequence
+        sendButtonElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+        await new Promise(resolve => setTimeout(resolve, 100)); 
+        sendButtonElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+        await new Promise(resolve => setTimeout(resolve, 100)); 
+        sendButtonElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+        
+        GM_log("AGA Controller: Simulated click sequence complete for injected text.");
+    }
+
+    // --- Unified Agent Communication Function ---
+    function sendCommandToAgent(commandPayload) {
+        // Guard Clause: Validate commandPayload structure
+        if (!commandPayload || typeof commandPayload !== 'object' ||
+            typeof commandPayload.command !== 'string' || typeof commandPayload.stdin !== 'string') {
+            GM_log("AGA Controller: Invalid command payload provided to sendCommandToAgent. Expected {command: string, stdin: string}. Payload: " + JSON.stringify(commandPayload));
+            // provide feedback to UI about this internal error too
+            injectTextAndClickSend("AGA Internal Error: Invalid payload structure before sending to agent."); 
+            return;
+        }
+
+        const dataToSend = JSON.stringify(commandPayload);
+        GM_log('AGA Controller: Preparing to send command object to Agent: ' + dataToSend);
+        GM_log('AGA Controller: Sending to Agent (' + AGENT_URL + '): ' + dataToSend);
+
         GM_xmlhttpRequest({
             method: "POST",
             url: AGENT_URL,
             headers: { "Content-Type": "application/json" },
-            data: JSON.stringify({ command: commandTextOrSystemSignal }),
-            timeout: 60000, 
-            onload: async function(response) { 
+            data: dataToSend,
+            timeout: 60000,
+            onload: async function(response) {
                 try {
                     const responseData = JSON.parse(response.responseText);
                     GM_log("AGA Controller: Agent responded: " + JSON.stringify(responseData));
-
-                    // --- Inject responseData into Gemini's input and click send ---
-                    const editorElement = document.querySelector(GEMINI_RESPONSE_INPUT_EDITOR_SELECTOR);
-                    if (!editorElement) {
-                        GM_log("AGA Controller: Editor element not found with selector: " + GEMINI_RESPONSE_INPUT_EDITOR_SELECTOR);
-                        return;
-                    }
-
-                    const textToInject = JSON.stringify(responseData, null, 2);
-                    
-                    GM_log(`AGA Controller: Attempting to inject JSON into editor: "${textToInject.substring(0,100)}..."`);
-                    editorElement.innerText = textToInject;
-                    await new Promise(resolve => setTimeout(resolve, 200)); // Increased delay
-
-                    // Dispatch input events to help frameworks recognize the change
-                    editorElement.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                    editorElement.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-                    await new Promise(resolve => setTimeout(resolve, 100)); // Increased delay
-
-                    const sendButtonElement = document.querySelector(GEMINI_RESPONSE_SEND_BUTTON_SELECTOR);
-                    if (!sendButtonElement) {
-                        GM_log("AGA Controller: Send button not found with selector: " + GEMINI_RESPONSE_SEND_BUTTON_SELECTOR + ". Cannot click send.");
-                        return; 
-                    }
-                    
-                    GM_log(`AGA Controller: Send button state before click: disabled=${sendButtonElement.disabled}, outerHTML=${sendButtonElement.outerHTML.substring(0,150)}`);
-                    GM_log("AGA Controller: Attempting to simulate hover and click send button programmatically.");
-
-                    // WAIT 1 SECOND BEFORE CLICKING
-                    await new Promise(resolve => setTimeout(resolve, 3000));
-
-                    // Simulate hover
-                    sendButtonElement.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true }));
-                    await new Promise(resolve => setTimeout(resolve, 100)); // Increased delay
-                    sendButtonElement.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
-                    await new Promise(resolve => setTimeout(resolve, 200)); // Increased delay
-
-                    // Simulate click sequence
-                    sendButtonElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-                    await new Promise(resolve => setTimeout(resolve, 100)); // Increased delay
-                    sendButtonElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-                    await new Promise(resolve => setTimeout(resolve, 100)); // Increased delay
-                    sendButtonElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                    
-                    GM_log("AGA Controller: Simulated click sequence complete.");
-                    // --- End of injection logic ---
-
+                    const formattedResponse = JSON.stringify(responseData, null, 2);
+                    injectTextAndClickSend(formattedResponse);
                 } catch (e) {
-                    GM_log(`AGA Controller: Error parsing Agent response or during injection: ${e}. Text: ${response.responseText}`);
+                    GM_log('AGA Controller: Error parsing Agent response: ' + e + '. Text: ' + response.responseText);
+                    injectTextAndClickSend("AGA Error: Could not parse response from Local Agent. Raw response: " + response.responseText.substring(0, 200));
                 }
             },
             onerror: function(response) {
-                GM_log(`AGA Controller: Error sending to Agent. Status: ${response.status}`);
+                GM_log('AGA Controller: Error sending to Agent. Status: ' + response.status);
+                injectTextAndClickSend("AGA Error: Failed to send command to Local Agent. Status: " + response.status);
             }
         });
     }
 
     // --- DOM Scraping Command Logic ---
     function checkForCommandsInTextAndSend(text) {
-        if (!text || typeof text !== 'string' || !text.includes(COMMAND_PREFIX)) {
+        // Guard Clause: Ensure text is a non-empty string
+        if (!text || typeof text !== 'string') {
             return;
         }
-        // Only respond to the latest (last) AGA:: instance
-        const regex = new RegExp(COMMAND_PREFIX + "([^\n]+)", "g");
-        let match;
-        let lastCommand = null;
-        while ((match = regex.exec(text)) !== null) {
-            const command = match[1].trim();
-            if (command) {
-                lastCommand = command;
-            }
+
+        const trimmedText = text.trim();
+        const commandPrefixIndex = trimmedText.lastIndexOf(COMMAND_PREFIX);
+
+        // Guard Clause: Check if COMMAND_PREFIX exists and has content after it
+        if (commandPrefixIndex === -1 || commandPrefixIndex + COMMAND_PREFIX.length >= trimmedText.length) {
+            return;
         }
-        if (lastCommand) {
-            sendCommandToAgent(lastCommand);
+
+        const potentialJsonString = trimmedText.substring(commandPrefixIndex + COMMAND_PREFIX.length);
+        if (!potentialJsonString) {
+            return;
         }
+
+        let parsedPayload;
+        try {
+            parsedPayload = JSON.parse(potentialJsonString);
+        } catch (e) {
+            GM_log('AGA Controller: Failed to parse JSON command part: "' + potentialJsonString + '". Error: ' + e);
+            const errorMessage = "AGA Error: Malformed JSON detected in your command.\nDetails: " + e.message + "\nProblematic JSON string: " + potentialJsonString.substring(0, 100) + (potentialJsonString.length > 100 ? "..." : "");
+            injectTextAndClickSend(errorMessage);
+            return; // Exit if JSON parsing fails
+        }
+
+        // Guard Clause: Validate the structure of the parsed JSON object (command is required)
+        if (!parsedPayload || typeof parsedPayload.command !== 'string') {
+            GM_log('AGA Controller: Parsed JSON, but command is missing or not a string: ' + potentialJsonString);
+            const errorMsg = "AGA Error: Parsed JSON is invalid. \'command\' field is missing or not a string. Received: " + potentialJsonString.substring(0,150);
+            injectTextAndClickSend(errorMsg);
+            return;
+        }
+
+        // Handle optional stdin: if present, must be a string; if absent, defaults to ""
+        if (parsedPayload.stdin === undefined) {
+            parsedPayload.stdin = "";
+        } else if (typeof parsedPayload.stdin !== 'string') {
+            GM_log('AGA Controller: Parsed JSON, command is valid, but stdin is present and not a string: ' + potentialJsonString);
+            const errorMsg = "AGA Error: Parsed JSON is invalid. \'stdin\' field, if present, must be a string. Received: " + potentialJsonString.substring(0,150);
+            injectTextAndClickSend(errorMsg);
+            return;
+        }
+
+        GM_log('AGA Controller: Valid command payload extracted: ' + JSON.stringify(parsedPayload));
+        sendCommandToAgent(parsedPayload);
     }
 
     function handlePotentialCommandEvent(event) {
+        // Guard Clause: Validate event and event.detail.text
         if (!event || !event.detail || typeof event.detail.text !== 'string') {
-            GM_log(`AGA Controller: Invalid ${AGA_POTENTIAL_COMMAND_EVENT}.`);
+            GM_log('AGA Controller: Invalid ' + AGA_POTENTIAL_COMMAND_EVENT + '.');
             return;
         }
-        GM_log(`AGA Controller: Received ${AGA_POTENTIAL_COMMAND_EVENT} with text: "${event.detail.text.substring(0,100)}..."`);
+        GM_log('AGA Controller: Received ' + AGA_POTENTIAL_COMMAND_EVENT + ' with text: "' + event.detail.text.substring(0,100) + '..."');
         checkForCommandsInTextAndSend(event.detail.text);
     }
 
@@ -172,9 +216,6 @@
     // --- Network Interception Utility Functions ---
     const isTargetStreamGenerateUrl = (url) => {
         if (!url) return false;
-        // For infix matching, we don't necessarily need to construct an absolute URL first,
-        // unless the substring itself might be confused with path segments of the current page.
-        // Assuming the substrings are specific enough.
         return url.includes(STREAM_GENERATE_URL_SUBSTRING);
     };
 
@@ -191,49 +232,41 @@
     // --- Network Interception Handlers ---
     function handleStreamGeneratePostOutcome(isSuccess, status, interceptionType, url) {
         if (!isSuccess) {
-            GM_log(`AGA Controller: ${interceptionType} POST not successful. Status: ${status}. URL: ${url}.`);
+            GM_log('AGA Controller: ' + interceptionType + ' POST not successful. Status: ' + status + '. URL: ' + url + '.');
             return;
         }
-
         if (isCalmDownPeriodActive) {
-            GM_log(`AGA Controller: ${interceptionType} POST occurred during calm down period. Ignoring. URL: ${url}`);
+            GM_log('AGA Controller: ' + interceptionType + ' POST occurred during calm down period. Ignoring. URL: ' + url);
             return;
         }
-
-        GM_log(`AGA Controller: ${interceptionType} POST successful. Waiting for RegenerateIcon. URL: ${url}`);
+        GM_log('AGA Controller: ' + interceptionType + ' POST successful. Waiting for RegenerateIcon. URL: ' + url);
         isWaitingForRegenerateIconResponse = true;
     }
 
     function handleRegenerateIconGet(interceptedUrl, interceptionType) {
-        GM_log(`AGA Controller: Intercepted ${interceptionType} GET to RegenerateIcon: ${interceptedUrl}. Waiting: ${isWaitingForRegenerateIconResponse}`);
+        GM_log('AGA Controller: Intercepted ' + interceptionType + ' GET to RegenerateIcon: ' + interceptedUrl + '. Waiting: ' + isWaitingForRegenerateIconResponse);
+        
         if (!isWaitingForRegenerateIconResponse) {
-            GM_log(`AGA Controller: RegenerateIcon GET, but not waiting. Ignoring.`);
+            GM_log('AGA Controller: RegenerateIcon GET, but not waiting. Ignoring.');
             return;
         }
 
-        GM_log(`AGA Controller: RegenerateIcon GET while waiting. Processing for commands in DOM.`);
+        GM_log('AGA Controller: RegenerateIcon GET while waiting. Processing for commands in DOM.');
+        isWaitingForRegenerateIconResponse = false; // Reset state immediately
 
-        // Perform DOM scraping and event dispatch
         const messageElements = document.querySelectorAll(MESSAGE_CONTENT_SELECTOR);
         if (messageElements.length === 0) {
-            GM_log(`AGA Controller: RegenerateIcon trigger, but no <${MESSAGE_CONTENT_SELECTOR}> elements found.`);
+            GM_log('AGA Controller: RegenerateIcon trigger, but no <' + MESSAGE_CONTENT_SELECTOR + '> elements found.');
         } else {
             const lastMessageElement = messageElements[messageElements.length - 1];
             const messageText = lastMessageElement.textContent || "";
-            let logText = messageText;
-            if (messageText.length > 100) {
-                logText = messageText.substring(0, 100) + "...";
-            }
-            GM_log(`AGA Controller: Text from <${MESSAGE_CONTENT_SELECTOR}>: "${logText}"`);
+            let logText = messageText.substring(0, 100) + (messageText.length > 100 ? "..." : "");
+            GM_log('AGA Controller: Text from <' + MESSAGE_CONTENT_SELECTOR + '>: "' + logText + '"');
             document.dispatchEvent(new CustomEvent(AGA_POTENTIAL_COMMAND_EVENT, { detail: { text: messageText } }));
         }
 
-        isWaitingForRegenerateIconResponse = false; // Reset state
-        GM_log(`AGA Controller: Reset isWaitingForRegenerateIconResponse.`);
-
-        // Activate calm down period
         isCalmDownPeriodActive = true;
-        GM_log(`AGA Controller: Calm down period activated for ${CALM_DOWN_DURATION_MS}ms.`);
+        GM_log('AGA Controller: Calm down period activated for ' + CALM_DOWN_DURATION_MS + 'ms.');
         setTimeout(() => {
             isCalmDownPeriodActive = false;
             GM_log("AGA Controller: Calm down period ended.");
@@ -256,10 +289,10 @@
 
         if (method === 'POST' && (isTargetStreamGenerateUrl(url) || isTargetBatchExecuteUrl(url))) {
             let requestType = isTargetStreamGenerateUrl(url) ? "StreamGenerate" : "BatchExecute";
-            GM_log(`AGA Controller: XHR ${requestType} POST: ${url}`);
+            GM_log('AGA Controller: XHR ' + requestType + ' POST: ' + url);
             const originalOnLoad = xhr.onload;
             xhr.onload = function() {
-                handleStreamGeneratePostOutcome(xhr.status === 200, xhr.status, `XHR ${requestType}`, url);
+                handleStreamGeneratePostOutcome(xhr.status === 200, xhr.status, 'XHR ' + requestType, url);
                 if (originalOnLoad) originalOnLoad.apply(this, arguments);
             };
         } else if (method === 'GET' && isTargetRegenerateIconUrl(url)) {
@@ -268,7 +301,7 @@
                 if (xhr.status === 200) {
                     handleRegenerateIconGet(url, "XHR");
                 } else {
-                    GM_log(`AGA Controller: XHR RegenerateIcon GET to ${url} not successful (Status: ${xhr.status}).`);
+                    GM_log('AGA Controller: XHR RegenerateIcon GET to ' + url + ' not successful (Status: ' + xhr.status + ').');
                     if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
                 }
                 if (originalOnLoad) originalOnLoad.apply(this, arguments);
@@ -284,28 +317,29 @@
 
         if (requestMethod === 'POST' && (isTargetStreamGenerateUrl(requestUrl) || isTargetBatchExecuteUrl(requestUrl))) {
             let requestType = isTargetStreamGenerateUrl(requestUrl) ? "StreamGenerate" : "BatchExecute";
-            GM_log(`AGA Controller: Fetch ${requestType} POST: ${requestUrl}`);
+            GM_log('AGA Controller: Fetch ' + requestType + ' POST: ' + requestUrl);
             try {
                 const response = await originalFetch(input, init);
-                handleStreamGeneratePostOutcome(response.ok, response.status, `Fetch ${requestType}`, requestUrl);
+                handleStreamGeneratePostOutcome(response.ok, response.status, 'Fetch ' + requestType, requestUrl);
                 return response;
             } catch (error) {
-                GM_log(`AGA Controller: Fetch ${requestType} POST error: ${error}. URL: ${requestUrl}`);
+                GM_log('AGA Controller: Fetch ' + requestType + ' POST error: ' + error + '. URL: ' + requestUrl);
+                if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
                 throw error;
             }
         } else if (requestMethod === 'GET' && isTargetRegenerateIconUrl(requestUrl)) {
-            GM_log(`AGA Controller: Fetch RegenerateIcon GET: ${requestUrl}`);
+            GM_log('AGA Controller: Fetch RegenerateIcon GET: ' + requestUrl);
             try {
                 const response = await originalFetch(input, init);
                 if (response.ok) {
                     handleRegenerateIconGet(requestUrl, "Fetch");
                 } else {
-                     GM_log(`AGA Controller: Fetch RegenerateIcon GET to ${requestUrl} not successful (Status: ${response.status}).`);
+                     GM_log('AGA Controller: Fetch RegenerateIcon GET to ' + requestUrl + ' not successful (Status: ' + response.status + ').');
                      if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
                 }
                 return response;
             } catch (error) {
-                GM_log(`AGA Controller: Fetch RegenerateIcon GET error: ${error}. URL: ${requestUrl}`);
+                GM_log('AGA Controller: Fetch RegenerateIcon GET error: ' + error + '. URL: ' + requestUrl);
                 if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
                 throw error;
             }
@@ -314,6 +348,6 @@
     };
 
     // --- Initialization ---
-    GM_log("AGA Controller (v2.3): Network interceptors initialized. Agent URL: " + AGENT_URL);
+    GM_log("AGA Controller (v2.5): Network interceptors initialized. Agent URL: " + AGENT_URL);
 
 })();

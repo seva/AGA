@@ -24,55 +24,34 @@ The AGA prototype is a minimalistic system designed to prove the core pipeline i
 
 **System Architecture:**
 
-A command's journey begins in the Gemini UI, where it is observed by a Browser-Side Controller (a Tampermonkey script). This script parses the command and sends it via an HTTP POST request to a Local Agent (a Python server) running on the user's machine. The agent validates the command, executes it in the OS Shell, and returns the result to the browser script.
+A command's journey begins in the Gemini UI, where it is observed by a Browser-Side Controller (a Tampermonkey script, current version v2.5). This script parses the command and sends it via an HTTP POST request to a Local Agent (a Python server) running on the user's machine. The agent validates the command, executes it in the OS Shell, and returns the result to the browser script.
 
 **Component Breakdown:**
 
-*   **Browser-Side Controller (JavaScript):**
-    *   **Detection:** Uses a `MutationObserver` to efficiently monitor the Gemini UI for DOM changes. This is a reactive approach that avoids inefficient polling.
-    *   **Parsing:** Scans new content for a command prefix (e.g., `AGA::`) and extracts the payload using a regular expression.
-    *   **Communication:** Uses the `fetch` API to send the command to the Local Agent.
+*   **Browser-Side Controller (JavaScript v2.5):**
+    *   **Detection Trigger:** Actively monitors Gemini's network activity. Specifically, it waits for network signals indicating that Gemini has finished generating a response (e.g., `StreamGenerate` or `BatchExecute` followed by `RegenerateIcon` image load). This event triggers the script to scrape the latest message content from the Gemini UI (looking for elements with the `message-content` class).
+    *   **Parsing:** Scans the scraped message content. A command is recognized if the trimmed text ends with the prefix (e.g., `AGA::`) followed immediately by a valid JSON string (e.g., `AGA::{\"command\":\"ls -la\", \"stdin\":\"some input\"}` or `AGA::{\"command\":\"ls -la\"}`). The entire `AGA::{...}` block must be at the very end of the message. The JSON object must contain a `command` string field. The `stdin` string field is optional; if omitted, it defaults to an empty string. The parsing logic employs Guard Clauses for early exit on invalid conditions.
+    *   **Communication (To Agent):** Uses the `GM_xmlhttpRequest` API to send the parsed command payload (the JSON object with `command` and defaulted `stdin`) to the Local Agent.
+    *   **Result and Error Feedback (To Gemini UI):** Utilizes a reusable function (`injectTextAndClickSend`) to manage UI interaction. 
+        *   Upon receiving a valid response from the Local Agent, the script injects this response (formatted as a JSON string) into Gemini's main input editor field and programmatically submits it.
+        *   If the script detects malformed JSON in the user's command, or if the parsed JSON has an invalid structure (e.g., missing `command` field), a detailed error message is constructed and injected back into the Gemini UI.
+        *   Errors during communication with the Local Agent (e.g., HTTP errors, failure to parse agent's response) are also reported back to the Gemini UI.
+    *   **State Management:** Implements a "calm down period" after command execution to prevent immediate re-triggering from subsequent network events.
+    *   **Style:** Code is styled using Guard Clauses where appropriate to improve readability and reduce nesting.
 *   **Local Agent (Python):**
-    *   **Framework:** Built with FastAPI for its performance, async capabilities, and automatic data validation via Pydantic models.
-    *   **Execution:** Leverages Python's `subprocess` module to run the command string directly in the host's default shell. It captures `stdout`, `stderr`, and the `return_code`.
-    *   **API Contract:** Exposes a single `POST /execute-command` endpoint that expects `{"command": "string"}` and returns a JSON object with the execution results.
+    *   **Framework:** Built with FastAPI for its performance, async capabilities, and automatic data validation via Pydantic models (`CommandRequest`, `CommandResponse`).
+    *   **Execution:** Leverages Python's `subprocess` module to run the command string (from the `command` field of the JSON payload) directly in the host's default shell (`shell=True`). It passes the `stdin` field (which defaults to an empty string if not provided by the client or `null`) as standard input to the executed command. It captures `stdout`, `stderr`, and the `return_code`.
+    *   **API Contract:** Exposes a single `POST /command` endpoint. It expects a JSON body like `{\"command\": \"string\", \"stdin\": \"string_or_null_or_omitted\"}`. `stdin` is optional and defaults to `\"\"` if not provided or null. Returns a JSON object with the execution results, including the original command and the (potentially defaulted) stdin.
+    *   **Error Handling:** Uses FastAPI's `HTTPException` for request validation errors and other command execution issues.
+    *   **Style:** The command execution endpoint (`execute_command`) uses Guard Clauses for input validation, improving code clarity.
 
 This design is intentionally simple, secure (as it runs entirely locally), and uses modern, efficient technologies to ensure the prototype is both robust and performant.
 
 ## 4. The Development Plan: An Agile Approach
 
-The prototype will be built using an agile methodology that prioritizes delivering a working end-to-end system as quickly as possible. We will work through a prioritized backlog of user stories, with each story representing a "vertical slice" of functionality.
+The prototype will be built using an agile methodology that prioritizes delivering a working end-to-end system as quickly as possible.
 
-**The Product Backlog:**
-
-*   **P0 - Core Functionality (Must-Haves):**
-    1.  **Story: Build the "Walking Skeleton"**
-        *   As a developer, I can create a local agent and a browser script to execute a hardcoded command, validating the entire architecture.
-    2.  **Story: Implement Command Detection & Parsing**
-        *   As a user, I want the browser script to use a `MutationObserver` to automatically detect and parse a command string from the Gemini UI.
-    3.  **Story: Enable Dynamic Command Execution**
-        *   As a user, I want the parsed command to be dynamically sent to the agent and executed.
-*   **P1 - Polish & Feedback Loop (Should-Haves):**
-    4.  **Story: Return Execution Results to Browser**
-        *   As a developer, I want the agent to return the execution results as a structured JSON response.
-    5.  **Story: Display Results in Console**
-        *   As a user, I want the browser script to log the agent's response, so I can see the outcome of my command in the browser's developer tools.
-
-This approach ensures that we have a demonstrable, valuable product at every step of development, starting from day one.
-
-## 5. Measuring Success
-
-For the prototype phase, success is not measured by user adoption or revenue, but by the unambiguous validation of the core technical hypothesis.
-
-**Success Metrics:**
-
-*   **Functionality:** The system successfully executes an arbitrary shell command, initiated from the Gemini UI, on a local machine. This is a binary metric: it either works or it doesn't.
-*   **Performance:** The time from a command appearing in the UI to the start of its execution by the local agent is less than 500 milliseconds. This ensures the system feels responsive and seamless.
-*   **Reliability:** The system completes the end-to-end loop successfully for 10 consecutive, different commands without requiring a restart of any component.
-
-Meeting these three metrics will confirm that the technical design is sound and that the project is ready to proceed to the next phase of adding more complex capabilities (GUI automation, self-modification).
-
-## 6. Frequently Asked Questions (FAQ)
+## 5. Frequently Asked Questions (FAQ)
 
 *   **Why scrape the web UI instead of using the official Gemini API?**
     This project's core hypothesis is about creating an agent that can operate in the same environment as the user. Using the web UI, especially for future GUI automation tasks, is a foundational requirement. While a direct API is more stable, it does not allow the agent to see what the user sees, which is critical for the long-term vision of observing and automating user workflows.

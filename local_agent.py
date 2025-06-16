@@ -7,50 +7,55 @@ app = FastAPI()
 
 class CommandRequest(BaseModel):
     command: str
+    stdin: str | None = "" # Add stdin field, default to empty string if not provided
 
 class CommandResponse(BaseModel):
     stdout: str
     stderr: str
     return_code: int
-    command: str
+    command: str # Include the original command
+    stdin: str | None = "" # Include the original stdin
 
 @app.post("/command", response_model=CommandResponse)
 async def execute_command(request: CommandRequest):
     """
     Executes a shell command and returns its output.
+    Accepts a command and an optional stdin string.
+    Refactored with Guard Clauses.
     """
     try:
-        # Basic security: ensure the command is a string
+        # Guard Clause: Ensure the command is a string
         if not isinstance(request.command, str):
             raise HTTPException(status_code=400, detail="Command must be a string.")
-
-        # For security and proper argument handling, especially on Windows,
-        # it's often better to pass a list of arguments to subprocess.run.
-        # However, the spec mentions "run the command string directly in the host's default shell".
-        # Using shell=True can be a security risk if the command string comes from an untrusted source.
-        # Since this is for local execution by a power user, we proceed with caution.
-        # On Windows, `shlex.split` might not work as expected for some shell built-ins.
-        # Consider platform-specific handling if issues arise.
         
-        # Using shell=True as per "run the command string directly in the host's default shell"
-        # This means the command is interpreted by the shell (e.g., cmd.exe on Windows, /bin/sh on Linux)
+        # Guard Clause: Ensure stdin is a string if provided
+        if request.stdin is not None and not isinstance(request.stdin, str):
+            raise HTTPException(status_code=400, detail="stdin must be a string if provided.")
+
+        # Main logic proceeds if guard clauses are passed
+        process_input = request.stdin # Will be None if request.stdin was None, or the string value
+
         process = subprocess.run(
             request.command,
             shell=True,
             capture_output=True,
             text=True,
+            input=process_input, # Pass stdin to the subprocess
             check=False # Don't raise an exception for non-zero exit codes
         )
         
         return CommandResponse(
             command=request.command,
+            stdin=request.stdin,
             stdout=process.stdout,
             stderr=process.stderr,
             return_code=process.returncode
         )
+    except HTTPException: # Re-raise HTTPException to let FastAPI handle it
+        raise
     except Exception as e:
         # Log the exception server-side for debugging
-        print(f"Error executing command: {request.command}, Error: {e}")
+        print(f"Error executing command: {request.command} with stdin: {request.stdin}, Error: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to execute command: {str(e)}")
 
 if __name__ == "__main__":
