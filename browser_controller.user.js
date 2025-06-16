@@ -1,14 +1,15 @@
 ﻿// ==UserScript==
 // @name         AGA Browser-Side Controller
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.1.5
 // @description  Handles commands, including ::browser_code for self-modification via agent-based code injection and Tampermonkey updates.
 // @author       AGA Developer
 // @match        https://gemini.google.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_log
 // @connect      localhost
-// @downloadURL  http://localhost:3000/script
+// @downloadURL  http://localhost:3000/browser_controller.user.js
+// @updateURL    http://localhost:3000/browser_controller.user.js
 // ==/UserScript==
 
 (function() {
@@ -19,6 +20,9 @@
     const AGENT_URL = "http://localhost:3000/command";
     const AGENT_INJECT_CODE_URL = "http://localhost:3000/inject_code"; // New endpoint
     const BROWSER_CODE_COMMAND = "::browser_code"; // Command name for browser code injection
+    // UPDATE THE SCRIPT_URL_FOR_UPDATE CONSTANT
+    const SCRIPT_URL_FOR_UPDATE = "http://localhost:3000/browser_controller.user.js";
+
 
     // --- Network Interception URL Substrings (for infix matching) ---
     const STREAM_GENERATE_URL_SUBSTRING = "/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
@@ -93,7 +97,7 @@
         }
     }
     // --- End of Spinner Functions ---
-
+    
     // --- Placeholder for dynamically injected browser code ---
     // --- INJECTED_BROWSER_CODE_START ---
     // Injected code will appear here.
@@ -232,7 +236,8 @@
                 // --- Success Logic (all guards passed) ---
                 await injectTextAndClickSend("AGA: Code injection successful. Update initiated in a new tab. Attempting to close update tab and refresh this Gemini tab in 5 seconds...");
                 
-                const updateTab = window.open('http://localhost:3000/script', '_blank');
+                GM_log("AGA Controller: Triggering Tampermonkey update by opening: " + SCRIPT_URL_FOR_UPDATE);
+                const updateTab = window.open(SCRIPT_URL_FOR_UPDATE, '_blank');
                 GM_log("AGA Controller: Update tab opened.");
 
                 setTimeout(async () => { // Made setTimeout callback async for potential await

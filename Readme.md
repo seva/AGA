@@ -54,7 +54,8 @@ A command's journey begins in the Gemini UI, where it is observed by a Browser-S
         *   When this endpoint receives JavaScript code, it reads the `browser_controller.user.js` file from disk.
         *   It locates the predefined placeholder section (between `// --- INJECTED_BROWSER_CODE_START ---` and `// --- INJECTED_BROWSER_CODE_END ---`).
         *   It replaces the content between these markers with the received JavaScript code.
-        *   It saves the modified `browser_controller.user.js` file back to disk and returns a success/failure message.
+        *   **Version Increment:** Crucially, it then finds the `// @version` line in the script's metadata block, parses the current version, increments the patch number (e.g., X.Y.Z to X.Y.Z+1, or X.Y to X.Y.1), and updates the `@version` line in the script content.
+        *   It saves the modified `browser_controller.user.js` file (with injected code and incremented version) back to disk and returns a success/failure message.
     *   **API Contract:**
         *   `POST /command`: Expects `{"command": "string", "stdin": "string_or_null_or_omitted"}`. Executes shell command. Returns execution results.
         *   `POST /inject_code`: Expects `{"code_to_inject": "string_javascript_code"}`. Modifies the `browser_controller.user.js` file on disk. Returns success/failure.
@@ -77,11 +78,11 @@ The `::browser_code` command, in conjunction with Tampermonkey's update feature 
     1.  A `::browser_code` command is sent from the Gemini UI. The `stdin` of this command contains the new JavaScript code intended to be executed or become a persistent part of the `browser_controller.user.js` script.
     2.  The currently running `browser_controller.user.js` (v3.1 or later) detects the `::browser_code` command.
     3.  It sends the JavaScript code from `stdin` to the Local Agent's `POST /inject_code` endpoint.
-    4.  The Local Agent reads the `browser_controller.user.js` file from disk, replaces the content within the placeholder section (`// --- INJECTED_BROWSER_CODE_START ---` to `// --- INJECTED_BROWSER_CODE_END ---`) with the new JavaScript code, and saves the file.
-    5.  The Local Agent responds with a success message to the `browser_controller.user.js`.
+    4.  The Local Agent reads the `browser_controller.user.js` file from disk, replaces the content within the placeholder section with the new JavaScript code, **and automatically increments the `@version` number in the script's header.** It then saves the file.
+    5.  The Local Agent responds with a success message (indicating code injection and version increment) to the `browser_controller.user.js`.
     6.  Upon receiving this success confirmation, the `browser_controller.user.js` script informs the user via the Gemini UI that the code injection was successful, an update is being initiated in a new tab, and an attempt will be made to close the update tab before the Gemini tab refreshes.
     7.  It then programmatically opens the `http://localhost:3000/script` URL in a new browser tab (`const updateTab = window.open('...', '_blank')`).
-    8.  Tampermonkey, running in the browser, detects this attempt to access its `@downloadURL` in the new tab. It fetches the script. If the fetched script (the newly modified version from disk) is different from the installed one (or has a higher `@version`), Tampermonkey will handle the update process (e.g., prompt the user or auto-update based on its settings).
+    8.  Tampermonkey, running in the browser, detects this attempt to access its `@downloadURL` in the new tab. It fetches the script. Because the `@version` of the fetched script (the newly modified version from disk) is now higher than the installed one, Tampermonkey recognizes it as an update and will handle the update process (e.g., prompt the user or auto-update based on its settings).
     9.  After a short delay (e.g., 5 seconds), to allow Tampermonkey to process the update from the new tab:
         *   The script attempts to close the `updateTab` (`updateTab.close()`). Due to browser security restrictions (especially if the new tab's content has changed or is cross-origin), this closure attempt is best-effort and might not always succeed. In such cases, the update tab may require manual closure.
         *   The original Gemini tab (where `browser_controller.user.js` is running) automatically refreshes itself (`window.location.reload()`). This reload ensures that the potentially updated version of the script is loaded and active in the Gemini tab.
