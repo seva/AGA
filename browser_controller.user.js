@@ -1,13 +1,14 @@
 ﻿// ==UserScript==
 // @name         AGA Browser-Side Controller
 // @namespace    http://tampermonkey.net/
-// @version      2.8
-// @description  Smarter JSON parsing error feedback; silent UI for missing/invalid command field.
+// @version      3.1
+// @description  Handles commands, including ::browser_code for self-modification via agent-based code injection and Tampermonkey updates.
 // @author       AGA Developer
 // @match        https://gemini.google.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_log
 // @connect      localhost
+// @downloadURL  http://localhost:3000/script
 // ==/UserScript==
 
 (function() {
@@ -16,6 +17,8 @@
     // --- Constants and Selectors ---
     const COMMAND_PREFIX = "AGA::";
     const AGENT_URL = "http://localhost:3000/command";
+    const AGENT_INJECT_CODE_URL = "http://localhost:3000/inject_code"; // New endpoint
+    const BROWSER_CODE_COMMAND = "::browser_code"; // Command name for browser code injection
 
     // --- Network Interception URL Substrings (for infix matching) ---
     const STREAM_GENERATE_URL_SUBSTRING = "/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
@@ -91,7 +94,12 @@
     }
     // --- End of Spinner Functions ---
 
-    GM_log("AGA Controller: Script loaded (v2.8 - Heuristic JSON error UI. Agent URL: " + AGENT_URL + ").");
+    // --- Placeholder for dynamically injected browser code ---
+    // --- INJECTED_BROWSER_CODE_START ---
+    // Injected code will appear here.
+    // --- INJECTED_BROWSER_CODE_END ---
+
+    GM_log("AGA Controller: Script loaded (v3.1 - Agent-based code injection. Agent URL: " + AGENT_URL + ", Inject URL: " + AGENT_INJECT_CODE_URL + ").");
 
     // --- Reusable UI Injection Function ---
     async function injectTextAndClickSend(textToInject) {
@@ -182,6 +190,74 @@
         });
     }
 
+    // --- Function to send code to agent for injection ---
+    async function sendCodeToAgentForInjection(codeToInject) {
+        showSpinner();
+        const payload = { code_to_inject: codeToInject };
+        GM_log('AGA Controller: Sending code to Agent for injection: ' + JSON.stringify(payload).substring(0, 100) + "...");
+
+        GM_xmlhttpRequest({
+            method: "POST",
+            url: AGENT_INJECT_CODE_URL,
+            headers: { "Content-Type": "application/json" },
+            data: JSON.stringify(payload),
+            timeout: 60000,
+            onload: async function(response) {
+                hideSpinner();
+
+                // Guard: Check for non-200 HTTP status first (network/server level errors)
+                if (response.status !== 200) {
+                    GM_log('AGA Controller: Agent /inject_code endpoint returned non-200 status: ' + response.status + '. ResponseText: ' + response.responseText);
+                    await injectTextAndClickSend("AGA Error: Code injection failed. Server error status: " + response.status + ". Details: " + response.responseText.substring(0,100));
+                    return;
+                }
+
+                let responseData;
+                try {
+                    responseData = JSON.parse(response.responseText);
+                } catch (e) {
+                    GM_log('AGA Controller: Error parsing Agent response from /inject_code: ' + e + '. Text: ' + response.responseText);
+                    await injectTextAndClickSend("AGA Error: Could not parse /inject_code response. Raw: " + response.responseText.substring(0, 200));
+                    return; // Guard: Exit on parse error
+                }
+
+                GM_log("AGA Controller: Agent responded from /inject_code: " + JSON.stringify(responseData));
+
+                // Guard: Exit if agent signals failure (e.g., markers not found, file issues)
+                if (!responseData.success) {
+                    await injectTextAndClickSend("AGA Error: Code injection failed. Agent response: " + (responseData.detail || responseData.message || "Unknown error from agent"));
+                    return;
+                }
+
+                // --- Success Logic (all guards passed) ---
+                await injectTextAndClickSend("AGA: Code injection successful. Update initiated in a new tab. Attempting to close update tab and refresh this Gemini tab in 5 seconds...");
+                
+                const updateTab = window.open('http://localhost:3000/script', '_blank');
+                GM_log("AGA Controller: Update tab opened.");
+
+                setTimeout(async () => { // Made setTimeout callback async for potential await
+                    GM_log("AGA Controller: Attempting to close update tab and reload Gemini tab.");
+                    if (updateTab) {
+                        try {
+                            updateTab.close();
+                            GM_log("AGA Controller: Attempted to close update tab.");
+                        } catch (e) {
+                            GM_log("AGA Controller: Error attempting to close update tab: " + e + ". It may need to be closed manually.");
+                        }
+                    }
+                    GM_log("AGA Controller: Reloading Gemini tab to apply script update.");
+                    window.location.reload();
+                }, 5000); // 5-second delay
+            },
+            onerror: async function(response) {
+                hideSpinner();
+                GM_log('AGA Controller: Error sending to Agent for code injection. Status: ' + response.status);
+                await injectTextAndClickSend("AGA Error: Failed to send code to Local Agent for injection. Status: " + response.status);
+            }
+        });
+    }
+
+
     // --- DOM Scraping Command Logic ---
     async function checkForCommandsInTextAndSend(text) { // Made async
         // Guard Clause: Ensure text is a non-empty string
@@ -226,7 +302,7 @@
                 // Heuristic: Only consider for UI error if it looks like an attempt at a JSON object.
                 const isLikelyJson = trimmedPotentialAttempt.startsWith('{') && 
                                     trimmedPotentialAttempt.endsWith('}') && 
-                                    trimmedPotentialAttempt.includes('command') && 
+                                    (trimmedPotentialAttempt.includes('command') || trimmedPotentialAttempt.includes('browser_code')) && 
                                     trimmedPotentialAttempt.includes(':');
 
                 if (isLikelyJson) {
@@ -242,13 +318,27 @@
             }
 
             // Successfully parsed JSON, now validate structure
-            // Silently ignore (in UI) if command field is missing or not a string.
             if (!parsedPayload || typeof parsedPayload.command !== 'string') {
                 GM_log('AGA Controller: Parsed JSON (from AGA:: at index ' + commandStartIndex + '), but \'command\' field is missing or not a string. Payload: ' + JSON.stringify(parsedPayload) + '. Original: ' + trimmedPotentialAttempt);
                 continue; // Try the next earlier AGA:: prefix
             }
 
-            // Handle optional stdin: if present, must be a string; if absent, defaults to ""
+            // Handle ::browser_code command specifically
+            if (parsedPayload.command === BROWSER_CODE_COMMAND) {
+                if (typeof parsedPayload.stdin !== 'string' || !parsedPayload.stdin.trim()) {
+                    GM_log('AGA Controller: Parsed JSON for ' + BROWSER_CODE_COMMAND + ', but stdin is missing, not a string, or empty. Payload: ' + JSON.stringify(parsedPayload));
+                    showSpinner(); // Show spinner before UI feedback for this error
+                    await injectTextAndClickSend("AGA Error: For " + BROWSER_CODE_COMMAND + ", 'stdin' must contain the JavaScript code to inject.");
+                    hideSpinner(); // Hide spinner after UI feedback
+                    return; // Stop processing, error reported
+                }
+                GM_log('AGA Controller: Valid ' + BROWSER_CODE_COMMAND + ' command. Sending code to agent for injection.');
+                await sendCodeToAgentForInjection(parsedPayload.stdin); // New handling for ::browser_code
+                return; // Command handled (sent for injection)
+            }
+
+
+            // For regular commands (not ::browser_code)
             if (parsedPayload.stdin === undefined) {
                 parsedPayload.stdin = "";
             } else if (typeof parsedPayload.stdin !== 'string') {
@@ -421,6 +511,6 @@
     };
 
     // --- Initialization ---
-    GM_log("AGA Controller (v2.8): Network interceptors initialized. Agent URL: " + AGENT_URL);
+    GM_log("AGA Controller (v3.1): Network interceptors initialized. Agent URL: " + AGENT_URL + ", Inject URL: " + AGENT_INJECT_CODE_URL);
 
 })();
