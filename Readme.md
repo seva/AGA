@@ -24,19 +24,19 @@ The AGA prototype is a minimalistic system designed to prove the core pipeline i
 
 **System Architecture:**
 
-A command's journey begins in the Gemini UI, where it is observed by a Browser-Side Controller (a Tampermonkey script, current version v3.1). This script parses the command. 
+A command's journey begins in the Gemini UI, where it is observed by a Browser-Side Controller (a Tampermonkey script, current version v3.1.8). This script parses the command. 
 *   For standard shell commands, it sends them via an HTTP POST request to a Local Agent (a Python server) running on the user's machine. The agent validates the command, executes it in the OS Shell, and returns the result to the browser script.
-*   For the special `::browser_code` command, the script sends the provided JavaScript code (from `stdin`) to a dedicated endpoint on the Local Agent (`POST /inject_code`). The agent then injects this code into a predefined section of the `browser_controller.user.js` file on disk. Upon successful injection, the browser script triggers Tampermonkey's update mechanism (by navigating to `GET /script`) to load the modified script.
+*   For the special `::browser_code` command, the script sends the provided JavaScript code (from `stdin`) to a dedicated endpoint on the Local Agent (`POST /inject_code`). The agent then injects this code into a predefined section of the `browser_controller.user.js` file on disk. Upon successful injection, the browser script triggers Tampermonkey's update mechanism (by navigating to `GET /browser_controller.user.js`) to load the modified script.
 
 **Component Breakdown:**
 
-*   **Browser-Side Controller (JavaScript v3.1):**
+*   **Browser-Side Controller (JavaScript v3.1.8):**
     *   **Detection Trigger:** Actively monitors Gemini's network activity. Specifically, it waits for network signals indicating that Gemini has finished generating a response (e.g., `StreamGenerate` or `BatchExecute` followed by `RegenerateIcon` image load). This event triggers the script to scrape the latest message content from the Gemini UI (looking for elements with the `message-content` class).
     *   **Parsing:** Scans the scraped message content. A command is recognized if the trimmed text ends with the prefix (e.g., `AGA::`) followed immediately by a valid JSON string (e.g., `AGA::{"command":"ls -la", "stdin":"some input"}` or `AGA::{"command":"::browser_code", "stdin":"alert('hello from injected code');"}`). The entire `AGA::{...}` block must be at the very end of the message. The JSON object must contain a `command` string field. The `stdin` string field is optional for shell commands (defaults to an empty string) but mandatory for `::browser_code` (contains the JavaScript to inject).
     *   **`::browser_code` Handling:** 
         *   If the command is `::browser_code`, the script validates that `stdin` contains JavaScript code.
         *   It then sends this JavaScript code to the `/inject_code` endpoint of the Local Agent.
-        *   Upon confirmation from the agent that the code has been injected into the `browser_controller.user.js` file on disk, the script initiates a browser navigation to `http://localhost:3000/script`.
+        *   Upon confirmation from the agent that the code has been injected into the `browser_controller.user.js` file on disk, the script initiates a browser navigation to `http://localhost:3000/browser_controller.user.js`.
         *   This navigation prompts Tampermonkey to check for updates, effectively loading the newly modified script containing the injected code.
     *   **Placeholder for Injected Code:** The script contains a predefined placeholder section (marked by `// --- INJECTED_BROWSER_CODE_START ---` and `// --- INJECTED_BROWSER_CODE_END ---`). The Local Agent injects new JavaScript code (provided via the `::browser_code` command) between these markers.
     *   **Communication (To Agent for shell commands):** Uses the `GM_xmlhttpRequest` API to send the parsed command payload (the JSON object with `command` and defaulted `stdin`) to the Local Agent's `/command` endpoint.
@@ -59,7 +59,7 @@ A command's journey begins in the Gemini UI, where it is observed by a Browser-S
     *   **API Contract:**
         *   `POST /command`: Expects `{"command": "string", "stdin": "string_or_null_or_omitted"}`. Executes shell command. Returns execution results.
         *   `POST /inject_code`: Expects `{"code_to_inject": "string_javascript_code"}`. Modifies the `browser_controller.user.js` file on disk. Returns success/failure.
-        *   `GET /script`: Serves the `browser_controller.user.js` file from local disk, enabling Tampermonkey's update mechanism.
+        *   `GET /browser_controller.user.js`: Serves the `browser_controller.user.js` file from local disk, enabling Tampermonkey's update mechanism.
     *   **Error Handling:** Uses FastAPI's `HTTPException` for request validation errors and other command execution issues.
     *   **Style:** The command execution endpoint (`execute_command`) uses Guard Clauses for input validation, improving code clarity.
 
@@ -70,18 +70,18 @@ This design is intentionally simple, secure (as it runs entirely locally), and u
 The `::browser_code` command, in conjunction with Tampermonkey's update feature and the Local Agent, enables a powerful self-updating mechanism for the browser-side component. This allows AGA to modify its own browser script logic based on instructions from Gemini.
 
 *   **Prerequisites (in place with v3.1+):**
-    *   The `browser_controller.user.js` script header includes `@downloadURL http://localhost:3000/script`.
-    *   The `local_agent.py` has a `GET /script` endpoint (to serve the script) and a `POST /inject_code` endpoint (to modify it).
+    *   The `browser_controller.user.js` script header includes `@downloadURL http://localhost:3000/browser_controller.user.js`.
+    *   The `local_agent.py` has a `GET /browser_controller.user.js` endpoint (to serve the script) and a `POST /inject_code` endpoint (to modify it).
     *   The `browser_controller.user.js` contains a placeholder section: `// --- INJECTED_BROWSER_CODE_START ---` ... `// --- INJECTED_BROWSER_CODE_END ---`.
 
 *   **The Automated "Self-Patching" Workflow:**
     1.  A `::browser_code` command is sent from the Gemini UI. The `stdin` of this command contains the new JavaScript code intended to be executed or become a persistent part of the `browser_controller.user.js` script.
-    2.  The currently running `browser_controller.user.js` (v3.1 or later) detects the `::browser_code` command.
+    2.  The currently running `browser_controller.user.js` (v3.1.8 or later) detects the `::browser_code` command.
     3.  It sends the JavaScript code from `stdin` to the Local Agent's `POST /inject_code` endpoint.
     4.  The Local Agent reads the `browser_controller.user.js` file from disk, replaces the content within the placeholder section with the new JavaScript code, **and automatically increments the `@version` number in the script's header.** It then saves the file.
     5.  The Local Agent responds with a success message (indicating code injection and version increment) to the `browser_controller.user.js`.
     6.  Upon receiving this success confirmation, the `browser_controller.user.js` script informs the user via the Gemini UI that the code injection was successful, an update is being initiated in a new tab, and an attempt will be made to close the update tab before the Gemini tab refreshes.
-    7.  It then programmatically opens the `http://localhost:3000/script` URL in a new browser tab (`const updateTab = window.open('...', '_blank')`).
+    7.  It then programmatically opens the `http://localhost:3000/browser_controller.user.js` URL in a new browser tab (`const updateTab = window.open('...', '_blank')`).
     8.  Tampermonkey, running in the browser, detects this attempt to access its `@downloadURL` in the new tab. It fetches the script. Because the `@version` of the fetched script (the newly modified version from disk) is now higher than the installed one, Tampermonkey recognizes it as an update and will handle the update process (e.g., prompt the user or auto-update based on its settings).
     9.  After a short delay (e.g., 5 seconds), to allow Tampermonkey to process the update from the new tab:
         *   The script attempts to close the `updateTab` (`updateTab.close()`). Due to browser security restrictions (especially if the new tab's content has changed or is cross-origin), this closure attempt is best-effort and might not always succeed. In such cases, the update tab may require manual closure.

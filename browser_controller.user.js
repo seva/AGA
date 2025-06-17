@@ -1,7 +1,7 @@
 ﻿// ==UserScript==
 // @name         AGA Browser-Side Controller
 // @namespace    http://tampermonkey.net/
-// @version      3.1.5
+// @version      3.1.8
 // @description  Handles commands, including ::browser_code for self-modification via agent-based code injection and Tampermonkey updates.
 // @author       AGA Developer
 // @match        https://gemini.google.com/*
@@ -97,11 +97,14 @@
         }
     }
     // --- End of Spinner Functions ---
-    
-    // --- Placeholder for dynamically injected browser code ---
-    // --- INJECTED_BROWSER_CODE_START ---
-    // Injected code will appear here.
-    // --- INJECTED_BROWSER_CODE_END ---
+
+    // --- Function to execute dynamically injected browser code ---
+    function executeDynamicallyInjectedBrowserCode() {
+        GM_log("AGA Controller: Executing dynamically injected browser code block.");
+        // --- INJECTED_BROWSER_CODE_START ---
+        // --- INJECTED_BROWSER_CODE_END ---
+        GM_log("AGA Controller: Finished executing dynamically injected browser code block.");
+    }
 
     GM_log("AGA Controller: Script loaded (v3.1 - Agent-based code injection. Agent URL: " + AGENT_URL + ", Inject URL: " + AGENT_INJECT_CODE_URL + ").");
 
@@ -419,8 +422,14 @@
             return;
         }
 
-        GM_log('AGA Controller: RegenerateIcon GET while waiting. Processing for commands in DOM.');
+        GM_log('AGA Controller: RegenerateIcon GET while waiting. Condition met to execute injected code.');
         isWaitingForRegenerateIconResponse = false; // Reset state immediately
+
+        // Execute the dynamically injected code
+        if(!window.injectionExecuted) {
+            executeDynamicallyInjectedBrowserCode();
+            window.injectionExecuted = true; // Prevent re-execution
+        }
 
         const messageElements = document.querySelectorAll(MESSAGE_CONTENT_SELECTOR);
         if (messageElements.length === 0) {
