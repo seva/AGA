@@ -205,15 +205,15 @@ console.log("New injected code ran successfully at " + new Date().toLocaleTimeSt
             },
             aiStudio: { // Placeholder
                 name: "AI Studio",
-                match: (url) => url.hostname.includes("aistudio.google.com") && url.pathname.startsWith("/chat"),
+                match: (url) => url.hostname.includes("aistudio.google.com"),
                 selectors: {
-                    messageContent: ".message-text", // Example, needs verification
-                    inputEditor: "textarea[placeholder='Enter a prompt here']", // Example, needs verification
-                    sendButton: "button[aria-label='Send message']", // Example, needs verification
+                    messageContent: ".turn-content",
+                    inputEditor: "div.text-input-wrapper > > textarea",
+                    sendButton: "button.run-button",
                 },
                 networkTriggers: {
-                    isPrimaryResponseStream: (url) => url.includes("/generateContent") || url.includes("/generate"), // Example, needs verification
-                    isCompletionSignal: (url) => false, // AI Studio might not have a secondary signal
+                    isPrimaryResponseStream: (url) => url.includes("/GenerateContent"),
+                    isCompletionSignal: (url) => url.includes("/CountTokens"),
                 },
                 state: {
                     isCalmDownPeriodActive: false,
@@ -244,12 +244,12 @@ console.log("New injected code ran successfully at " + new Date().toLocaleTimeSt
                 getTextFromResponseElements: function() {
                     // TODO: Implement AI Studio specific text extraction
                     const messageAreas = document.querySelectorAll(this.selectors.messageContent); // Example
-                    if (messageAreas.length === 0) {
+                    if (!messageAreas.length) {
                         GM_log(`AGA Controller (${this.name}): No message elements found with selector: ${this.selectors.messageContent}`);
                         return "";
                     }
-                    // AI Studio might have multiple parts, need to find the last complete one
-                    return Array.from(messageAreas).map(el => el.textContent).join("\n\n").trim();
+                    // Select the text content of the last message element
+                    return messageAreas[messageAreas.length - 1].textContent.trim();
                 },
                 injectTextAndClickSend: async function(textToInject) {
                     // TODO: Implement AI Studio specific injection
@@ -265,7 +265,7 @@ console.log("New injected code ran successfully at " + new Date().toLocaleTimeSt
                     editorElement.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
                     editorElement.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
                     
-                    await new Promise(resolve => setTimeout(resolve, 100)); // Wait for UI to update
+                    await new Promise(resolve => setTimeout(resolve, 500)); // Wait for UI to update
 
                     const sendButtonElement = document.querySelector(this.selectors.sendButton);
                     if (!sendButtonElement) {
