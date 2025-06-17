@@ -1,10 +1,11 @@
 ﻿// ==UserScript==
 // @name         AGA Browser-Side Controller
 // @namespace    http://tampermonkey.net/
-// @version      3.1.8
+// @version      3.2.3 // Agent will increment patch version upon successful code injection
 // @description  Handles commands, including ::browser_code for self-modification via agent-based code injection and Tampermonkey updates.
 // @author       AGA Developer
 // @match        https://gemini.google.com/*
+// @match        https://aistudio.google.com/chat/* 
 // @grant        GM_xmlhttpRequest
 // @grant        GM_log
 // @connect      localhost
@@ -15,35 +16,19 @@
 (function() {
     'use strict';
 
-    // --- Constants and Selectors ---
+    // --- GENERIC CORE LOGIC & CONSTANTS ---
     const COMMAND_PREFIX = "AGA::";
     const AGENT_URL = "http://localhost:3000/command";
-    const AGENT_INJECT_CODE_URL = "http://localhost:3000/inject_code"; // New endpoint
-    const BROWSER_CODE_COMMAND = "::browser_code"; // Command name for browser code injection
-    // UPDATE THE SCRIPT_URL_FOR_UPDATE CONSTANT
+    const AGENT_INJECT_CODE_URL = "http://localhost:3000/inject_code";
+    const BROWSER_CODE_COMMAND = "::browser_code";
     const SCRIPT_URL_FOR_UPDATE = "http://localhost:3000/browser_controller.user.js";
 
-
-    // --- Network Interception URL Substrings (for infix matching) ---
-    const STREAM_GENERATE_URL_SUBSTRING = "/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate";
-    const REGENERATE_ICON_URL_SUBSTRING = "/lamda/images/regenerate";
-    const BATCH_EXECUTE_URL_SUBSTRING = "/BardChatUi/data/batchexecute";
-
-    // --- Constants for DOM Scraping Logic ---
+    // --- Custom Event Names ---
     const AGA_POTENTIAL_COMMAND_EVENT = "AgaPotentialCommandEvent";
-    const MESSAGE_CONTENT_SELECTOR = "message-content";
+    const AGA_NETWORK_RESPONSE_EVENT = "AgaNetworkResponseEvent"; // New generic event
 
-    // --- Selectors for Injecting Agent Response ---
-    const GEMINI_RESPONSE_INPUT_EDITOR_SELECTOR = "div.ql-editor";
-    const GEMINI_RESPONSE_SEND_BUTTON_SELECTOR = "button.send-button";
-
-    // --- State variable for network flow ---
-    let isWaitingForRegenerateIconResponse = false;
-    let isCalmDownPeriodActive = false;
-    const CALM_DOWN_DURATION_MS = 2000;
-
-    // --- Spinner Elements and Functions ---
-    let spinnerElement = null; // Keep a reference to the spinner element
+    // --- Spinner Elements and Functions (Generic) ---
+    let spinnerElement = null;
 
     function createSpinnerElement() {
         const svgNS = "http://www.w3.org/2000/svg";
@@ -76,99 +61,251 @@
         svg.appendChild(circle);
         svg.appendChild(path);
         spinnerDiv.appendChild(svg);
+        document.body.appendChild(spinnerDiv); // Append spinner to body once
         return spinnerDiv;
     }
 
     function showSpinner() {
         if (!spinnerElement) {
             spinnerElement = createSpinnerElement();
-            document.body.appendChild(spinnerElement);
         }
-        if (spinnerElement) {
-            GM_log("AGA Controller: Showing spinner.");
-            spinnerElement.style.display = 'block';
-        }
+        GM_log("AGA Controller: Showing spinner.");
+        spinnerElement.style.display = 'block';
     }
 
     function hideSpinner() {
-        if (spinnerElement) {
-            GM_log("AGA Controller: Hiding spinner.");
-            spinnerElement.style.display = 'none';
+        if (!spinnerElement) {
+            GM_log("AGA Controller: Spinner does not exist, cannot hide.");
+            return;
         }
+        GM_log("AGA Controller: Hiding spinner.");
+        spinnerElement.style.display = 'none';
     }
     // --- End of Spinner Functions ---
 
-    // --- Function to execute dynamically injected browser code ---
+    // --- Function to execute dynamically injected browser code (Generic) ---
     function executeDynamicallyInjectedBrowserCode() {
         GM_log("AGA Controller: Executing dynamically injected browser code block.");
         // --- INJECTED_BROWSER_CODE_START ---
-        // --- INJECTED_BROWSER_CODE_END ---
+console.log("New injected code ran successfully at " + new Date().toLocaleTimeString());
+    // --- INJECTED_BROWSER_CODE_END ---
         GM_log("AGA Controller: Finished executing dynamically injected browser code block.");
     }
 
-    GM_log("AGA Controller: Script loaded (v3.1 - Agent-based code injection. Agent URL: " + AGENT_URL + ", Inject URL: " + AGENT_INJECT_CODE_URL + ").");
+    // --- UI ADAPTERS ---
+    const UIManager = {
+        currentAdapter: null,
+        adapters: {
+            gemini: {
+                name: "Gemini",
+                match: (url) => url.hostname.includes("gemini.google.com"),
+                selectors: {
+                    messageContent: "message-content",
+                    inputEditor: "div.ql-editor",
+                    sendButton: "button.send-button",
+                },
+                networkTriggers: {
+                    isPrimaryResponseStream: (url) => url.includes("/BardChatUi/data/assistant.lamda.BardFrontendService/StreamGenerate") || url.includes("/BardChatUi/data/batchexecute"),
+                    isCompletionSignal: (url) => url.includes("/lamda/images/regenerate"),
+                },
+                state: {
+                    isWaitingForCompletionSignal: false,
+                    isCalmDownPeriodActive: false,
+                    calmDownDurationMs: 2000,
+                },
+                initialize: function() {
+                    GM_log(`AGA Controller: Initializing ${this.name} adapter.`);
+                    this.state.isWaitingForCompletionSignal = false;
+                    this.state.isCalmDownPeriodActive = false;
+                    document.addEventListener(AGA_NETWORK_RESPONSE_EVENT, this.handleNetworkResponse.bind(this));
+                },
+                handleNetworkResponse: function(event) {
+                    const { method, url, status } = event.detail;
+                    let isReadyToProcess = false;
 
-    // --- Reusable UI Injection Function ---
-    async function injectTextAndClickSend(textToInject) {
-        const editorElement = document.querySelector(GEMINI_RESPONSE_INPUT_EDITOR_SELECTOR);
-        if (!editorElement) {
-            GM_log("AGA Controller: Editor element not found with selector: " + GEMINI_RESPONSE_INPUT_EDITOR_SELECTOR);
-            return;
+                    if (method === 'POST' && this.networkTriggers.isPrimaryResponseStream(url)) {
+                        if (status === 200 && !this.state.isCalmDownPeriodActive) {
+                            GM_log(`AGA Controller (${this.name}): Main content POST successful. Waiting for completion signal.`);
+                            this.state.isWaitingForCompletionSignal = true;
+                        } else if (status !== 200) {
+                            GM_log(`AGA Controller (${this.name}): Main content POST not successful. Status: ${status}`);
+                            this.state.isWaitingForCompletionSignal = false;
+                        }
+                    } else if (method === 'GET' && this.networkTriggers.isCompletionSignal(url)) {
+                        if (this.state.isWaitingForCompletionSignal && status === 200) {
+                            GM_log(`AGA Controller (${this.name}): Completion signal GET successful. Ready to process.`);
+                            isReadyToProcess = true;
+                            this.state.isWaitingForCompletionSignal = false; // Reset state
+                            this.state.isCalmDownPeriodActive = true;
+                            setTimeout(() => {
+                                this.state.isCalmDownPeriodActive = false;
+                                GM_log(`AGA Controller (${this.name}): Calm down period ended.`);
+                            }, this.state.calmDownDurationMs);
+                        } else if (status !== 200 && this.state.isWaitingForCompletionSignal) {
+                             GM_log(`AGA Controller (${this.name}): Completion signal GET not successful (Status: ${status}). Resetting wait.`);
+                             this.state.isWaitingForCompletionSignal = false;
+                        }
+                    }
+
+                    if (!isReadyToProcess) {
+                        // If not ready to process, ignore
+                        return;
+                    }
+                    const text = this.getTextFromResponseElements();
+                    if (!text) {
+                        // If no text found, log and ignore
+                        GM_log(`AGA Controller (${this.name}): No text found in response elements with selector: ${this.selectors.messageContent}`);
+                        return;
+                    }
+                    GM_log(`AGA Controller (${this.name}): Dispatching ${AGA_POTENTIAL_COMMAND_EVENT} from adapter.`);
+                    document.dispatchEvent(new CustomEvent(AGA_POTENTIAL_COMMAND_EVENT, { detail: { text: text } }));
+                },
+                getTextFromResponseElements: function() {
+                    const messageElements = document.querySelectorAll(this.selectors.messageContent);
+                    if (!messageElements.length) {
+                        GM_log(`AGA Controller (${this.name}): No message elements found with selector: ${this.selectors.messageContent}`);
+                        return "";
+                    }
+                    return messageElements[messageElements.length - 1].textContent || "";
+                },
+                injectTextAndClickSend: async function(textToInject) {
+                    GM_log(`AGA Controller (${this.name}): Injecting text via adapter: "${String(textToInject).substring(0,50)}..."`);
+                    showSpinner();
+                    const editorElement = document.querySelector(this.selectors.inputEditor);
+                    if (!editorElement) {
+                        GM_log(`AGA Controller (${this.name}): Editor element not found with selector: ${this.selectors.inputEditor}`);
+                        hideSpinner();
+                        return;
+                    }
+                    editorElement.innerText = String(textToInject);
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    editorElement.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                    editorElement.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                    await new Promise(resolve => setTimeout(resolve, 100));
+
+                    const sendButtonElement = document.querySelector(this.selectors.sendButton);
+                    if (!sendButtonElement) {
+                        GM_log(`AGA Controller (${this.name}): Send button not found with selector: ${this.selectors.sendButton}`);
+                        hideSpinner();
+                        return;
+                    }
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    sendButtonElement.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true }));
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    sendButtonElement.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
+                    await new Promise(resolve => setTimeout(resolve, 200));
+                    sendButtonElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    sendButtonElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
+                    await new Promise(resolve => setTimeout(resolve, 100));
+                    sendButtonElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    GM_log(`AGA Controller (${this.name}): Simulated click sequence complete for injected text.`);
+                    hideSpinner();
+                }
+            },
+            aiStudio: { // Placeholder
+                name: "AI Studio",
+                match: (url) => url.hostname.includes("aistudio.google.com") && url.pathname.startsWith("/chat"),
+                selectors: {
+                    messageContent: ".message-text", // Example, needs verification
+                    inputEditor: "textarea[placeholder='Enter a prompt here']", // Example, needs verification
+                    sendButton: "button[aria-label='Send message']", // Example, needs verification
+                },
+                networkTriggers: {
+                    isPrimaryResponseStream: (url) => url.includes("/generateContent") || url.includes("/generate"), // Example, needs verification
+                    isCompletionSignal: (url) => false, // AI Studio might not have a secondary signal
+                },
+                state: {
+                    isCalmDownPeriodActive: false,
+                    calmDownDurationMs: 1500,
+                },
+                initialize: function() {
+                    GM_log(`AGA Controller: Initializing ${this.name} adapter.`);
+                    this.state.isCalmDownPeriodActive = false;
+                    document.addEventListener(AGA_NETWORK_RESPONSE_EVENT, this.handleNetworkResponse.bind(this));
+                },
+                handleNetworkResponse: function(event) {
+                    const { method, url, status } = event.detail;
+                    if (method === 'POST' && this.networkTriggers.isPrimaryResponseStream(url) && status === 200 && !this.state.isCalmDownPeriodActive) {
+                        GM_log(`AGA Controller (${this.name}): Response stream finished. Ready to process.`);
+                        this.state.isCalmDownPeriodActive = true;
+                        setTimeout(() => {
+                            this.state.isCalmDownPeriodActive = false;
+                            GM_log(`AGA Controller (${this.name}): Calm down period ended.`);
+                        }, this.state.calmDownDurationMs);
+
+                        const text = this.getTextFromResponseElements();
+                        if (text) {
+                            GM_log(`AGA Controller (${this.name}): Dispatching ${AGA_POTENTIAL_COMMAND_EVENT} from adapter.`);
+                            document.dispatchEvent(new CustomEvent(AGA_POTENTIAL_COMMAND_EVENT, { detail: { text: text } }));
+                        }
+                    }
+                },
+                getTextFromResponseElements: function() {
+                    // TODO: Implement AI Studio specific text extraction
+                    const messageAreas = document.querySelectorAll(this.selectors.messageContent); // Example
+                    if (messageAreas.length === 0) {
+                        GM_log(`AGA Controller (${this.name}): No message elements found with selector: ${this.selectors.messageContent}`);
+                        return "";
+                    }
+                    // AI Studio might have multiple parts, need to find the last complete one
+                    return Array.from(messageAreas).map(el => el.textContent).join("\n\n").trim();
+                },
+                injectTextAndClickSend: async function(textToInject) {
+                    // TODO: Implement AI Studio specific injection
+                    GM_log(`AGA Controller (${this.name}): Injecting text via adapter: "${String(textToInject).substring(0,50)}..."`);
+                    showSpinner();
+                    const editorElement = document.querySelector(this.selectors.inputEditor);
+                    if (!editorElement) {
+                         GM_log(`AGA Controller (${this.name}): Editor element not found with selector: ${this.selectors.inputEditor}`);
+                         hideSpinner();
+                         return;
+                    }
+                    editorElement.value = String(textToInject);
+                    editorElement.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                    editorElement.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                    
+                    await new Promise(resolve => setTimeout(resolve, 100)); // Wait for UI to update
+
+                    const sendButtonElement = document.querySelector(this.selectors.sendButton);
+                    if (!sendButtonElement) {
+                        GM_log(`AGA Controller (${this.name}): Send button not found with selector: ${this.selectors.sendButton}`);
+                        hideSpinner();
+                        return;
+                    }
+                    sendButtonElement.click();
+                    await new Promise(resolve => setTimeout(resolve, 500)); // Wait for action to process
+                    hideSpinner();
+                }
+            }
+        },
+        selectAdapter: function() {
+            const currentUrl = new URL(window.location.href);
+            for (const key in this.adapters) {
+                if (this.adapters[key].match(currentUrl)) {
+                    this.currentAdapter = this.adapters[key];
+                    GM_log(`AGA Controller: Selected UI adapter: ${this.currentAdapter.name}`);
+                    this.currentAdapter.initialize(); // This will set up the event listener
+                    return;
+                }
+            }
+            GM_log("AGA Controller: No suitable UI adapter found for URL: " + window.location.href);
         }
+    };
 
-        GM_log('AGA Controller: Attempting to inject text into editor: "' + String(textToInject).substring(0,100) + '..."');
-        // Ensure textToInject is a string, especially if it's an error object.
-        editorElement.innerText = String(textToInject);
-        await new Promise(resolve => setTimeout(resolve, 200)); // Increased delay
-
-        // Dispatch input events to help frameworks recognize the change
-        editorElement.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-        editorElement.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-        await new Promise(resolve => setTimeout(resolve, 100)); // Increased delay
-
-        const sendButtonElement = document.querySelector(GEMINI_RESPONSE_SEND_BUTTON_SELECTOR);
-        if (!sendButtonElement) {
-            GM_log("AGA Controller: Send button not found with selector: " + GEMINI_RESPONSE_SEND_BUTTON_SELECTOR + ". Cannot click send.");
-            return;
-        }
-        
-        GM_log('AGA Controller: Send button state before click: disabled=' + sendButtonElement.disabled + ', outerHTML=' + sendButtonElement.outerHTML.substring(0,150));
-        GM_log("AGA Controller: Attempting to simulate hover and click send button programmatically.");
-
-        // WAIT before CLICKING
-        await new Promise(resolve => setTimeout(resolve, 1000)); // Adjusted wait time
-
-        // Simulate hover
-        sendButtonElement.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true, cancelable: true }));
-        await new Promise(resolve => setTimeout(resolve, 100)); 
-        sendButtonElement.dispatchEvent(new MouseEvent('mouseover', { bubbles: true, cancelable: true }));
-        await new Promise(resolve => setTimeout(resolve, 200)); 
-
-        // Simulate click sequence
-        sendButtonElement.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, cancelable: true }));
-        await new Promise(resolve => setTimeout(resolve, 100)); 
-        sendButtonElement.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, cancelable: true }));
-        await new Promise(resolve => setTimeout(resolve, 100)); 
-        sendButtonElement.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-        
-        GM_log("AGA Controller: Simulated click sequence complete for injected text.");
-    }
-
-    // --- Unified Agent Communication Function ---
-    function sendCommandToAgent(commandPayload) {
-        // Guard Clause: Validate commandPayload structure
+    // --- Generic Agent Communication Functions ---
+    async function sendCommandToAgent(commandPayload, uiAdapter) {
+        // Guard Clause: Validate commandPayload structure (moved from original global function)
         if (!commandPayload || typeof commandPayload !== 'object' ||
-            typeof commandPayload.command !== 'string' || typeof commandPayload.stdin !== 'string') {
-            GM_log("AGA Controller: Invalid command payload provided to sendCommandToAgent. Expected {command: string, stdin: string}. Payload: " + JSON.stringify(commandPayload));
-            // provide feedback to UI about this internal error too
-            injectTextAndClickSend("AGA Internal Error: Invalid payload structure before sending to agent."); 
+            typeof commandPayload.command !== 'string' ||
+            (commandPayload.stdin !== undefined && typeof commandPayload.stdin !== 'string') ) { // stdin can be undefined
+            GM_log("AGA Controller: Invalid command payload. Expected {command: string, stdin?: string}. Payload: " + JSON.stringify(commandPayload));
+            await uiAdapter.injectTextAndClickSend("AGA Internal Error: Invalid payload structure before sending to agent.");
             return;
         }
-
-        showSpinner(); // Show spinner before sending command
-        const dataToSend = JSON.stringify(commandPayload);
+        // Ensure stdin is a string if it's undefined (for GM_xmlhttpRequest data)
+        const dataToSend = JSON.stringify({ ...commandPayload, stdin: commandPayload.stdin || "" });
         GM_log('AGA Controller: Preparing to send command object to Agent: ' + dataToSend);
-        GM_log('AGA Controller: Sending to Agent (' + AGENT_URL + '): ' + dataToSend);
 
         GM_xmlhttpRequest({
             method: "POST",
@@ -177,32 +314,33 @@
             data: dataToSend,
             timeout: 60000,
             onload: async function(response) {
+                let responseDataText = "AGA Error: Empty response from agent.";
                 try {
                     const responseData = JSON.parse(response.responseText);
                     GM_log("AGA Controller: Agent responded: " + JSON.stringify(responseData));
-                    const formattedResponse = JSON.stringify(responseData, null, 2);
-                    await injectTextAndClickSend(formattedResponse);
+                    responseDataText = JSON.stringify(responseData, null, 2);
                 } catch (e) {
                     GM_log('AGA Controller: Error parsing Agent response: ' + e + '. Text: ' + response.responseText);
-                    await injectTextAndClickSend("AGA Error: Could not parse response from Local Agent. Raw response: " + response.responseText.substring(0, 200));
-                } finally {
-                    hideSpinner(); // Hide spinner after operation completes or fails
+                    responseDataText = "AGA Error: Could not parse response from Local Agent. Raw response: " + response.responseText.substring(0, 200);
                 }
+                await uiAdapter.injectTextAndClickSend(responseDataText);
             },
-            onerror: async function(response) { // Make onerror async
+            onerror: async function(response) {
                 GM_log('AGA Controller: Error sending to Agent. Status: ' + response.status);
-                await injectTextAndClickSend("AGA Error: Failed to send command to Local Agent. Status: " + response.status);
-                hideSpinner(); // Hide spinner after error handling
+                const errorMsg = "AGA Error: Failed to send command to Local Agent. Status: " + response.status;
+                await uiAdapter.injectTextAndClickSend(errorMsg);
+            },
+            ontimeout: async function() {
+                GM_log('AGA Controller: Timeout sending command to Agent.');
+                const errorMsg = "AGA Error: Timeout sending command to Local Agent.";
+                await uiAdapter.injectTextAndClickSend(errorMsg);
             }
         });
     }
 
-    // --- Function to send code to agent for injection ---
-    async function sendCodeToAgentForInjection(codeToInject) {
-        showSpinner();
+    async function sendCodeToAgentForInjection(codeToInject, uiAdapter) {
         const payload = { code_to_inject: codeToInject };
         GM_log('AGA Controller: Sending code to Agent for injection: ' + JSON.stringify(payload).substring(0, 100) + "...");
-
         GM_xmlhttpRequest({
             method: "POST",
             url: AGENT_INJECT_CODE_URL,
@@ -210,72 +348,58 @@
             data: JSON.stringify(payload),
             timeout: 60000,
             onload: async function(response) {
-                hideSpinner();
-
-                // Guard: Check for non-200 HTTP status first (network/server level errors)
+                let responseMessage = "AGA Error: Code injection failed. Unknown server error.";
                 if (response.status !== 200) {
                     GM_log('AGA Controller: Agent /inject_code endpoint returned non-200 status: ' + response.status + '. ResponseText: ' + response.responseText);
-                    await injectTextAndClickSend("AGA Error: Code injection failed. Server error status: " + response.status + ". Details: " + response.responseText.substring(0,100));
-                    return;
-                }
-
-                let responseData;
-                try {
-                    responseData = JSON.parse(response.responseText);
-                } catch (e) {
-                    GM_log('AGA Controller: Error parsing Agent response from /inject_code: ' + e + '. Text: ' + response.responseText);
-                    await injectTextAndClickSend("AGA Error: Could not parse /inject_code response. Raw: " + response.responseText.substring(0, 200));
-                    return; // Guard: Exit on parse error
-                }
-
-                GM_log("AGA Controller: Agent responded from /inject_code: " + JSON.stringify(responseData));
-
-                // Guard: Exit if agent signals failure (e.g., markers not found, file issues)
-                if (!responseData.success) {
-                    await injectTextAndClickSend("AGA Error: Code injection failed. Agent response: " + (responseData.detail || responseData.message || "Unknown error from agent"));
-                    return;
-                }
-
-                // --- Success Logic (all guards passed) ---
-                await injectTextAndClickSend("AGA: Code injection successful. Update initiated in a new tab. Attempting to close update tab and refresh this Gemini tab in 5 seconds...");
-                
-                GM_log("AGA Controller: Triggering Tampermonkey update by opening: " + SCRIPT_URL_FOR_UPDATE);
-                const updateTab = window.open(SCRIPT_URL_FOR_UPDATE, '_blank');
-                GM_log("AGA Controller: Update tab opened.");
-
-                setTimeout(async () => { // Made setTimeout callback async for potential await
-                    GM_log("AGA Controller: Attempting to close update tab and reload Gemini tab.");
-                    if (updateTab) {
-                        try {
-                            updateTab.close();
-                            GM_log("AGA Controller: Attempted to close update tab.");
-                        } catch (e) {
-                            GM_log("AGA Controller: Error attempting to close update tab: " + e + ". It may need to be closed manually.");
+                    responseMessage = "AGA Error: Code injection failed. Server error status: " + response.status + ". Details: " + response.responseText.substring(0,100);
+                } else {
+                    try {
+                        const responseData = JSON.parse(response.responseText);
+                        GM_log("AGA Controller: Agent responded from /inject_code: " + JSON.stringify(responseData));
+                        if (!responseData.success) {
+                            responseMessage = "AGA Error: Code injection failed. Agent response: " + (responseData.detail || responseData.message || "Unknown error from agent");
+                        } else {
+                            responseMessage = "AGA: Code injection successful. Update initiated. Refreshing in 5s...";
+                            // This part is generic
+                            GM_log("AGA Controller: Triggering Tampermonkey update by opening: " + SCRIPT_URL_FOR_UPDATE);
+                            const updateTab = window.open(SCRIPT_URL_FOR_UPDATE, '_blank');
+                            GM_log("AGA Controller: Update tab opened.");
+                            setTimeout(async () => {
+                                GM_log("AGA Controller: Attempting to close update tab and reload current tab.");
+                                if (updateTab) { try { updateTab.close(); } catch (e) { GM_log("AGA Controller: Error closing update tab: " + e); } }
+                                window.location.reload();
+                            }, 5000);
                         }
+                    } catch (e) {
+                        GM_log('AGA Controller: Error parsing Agent response from /inject_code: ' + e + '. Text: ' + response.responseText);
+                        responseMessage = "AGA Error: Could not parse /inject_code response. Raw: " + response.responseText.substring(0, 200);
                     }
-                    GM_log("AGA Controller: Reloading Gemini tab to apply script update.");
-                    window.location.reload();
-                }, 5000); // 5-second delay
+                }
+                await uiAdapter.injectTextAndClickSend(responseMessage);
             },
             onerror: async function(response) {
-                hideSpinner();
                 GM_log('AGA Controller: Error sending to Agent for code injection. Status: ' + response.status);
-                await injectTextAndClickSend("AGA Error: Failed to send code to Local Agent for injection. Status: " + response.status);
+                const errorMsg = "AGA Error: Failed to send code to Local Agent for injection. Status: " + response.status;
+                await uiAdapter.injectTextAndClickSend(errorMsg);
+            },
+            ontimeout: async function() {
+                GM_log('AGA Controller: Timeout sending code to Agent for injection.');
+                const errorMsg = "AGA Error: Timeout sending code to Local Agent for injection.";
+                await uiAdapter.injectTextAndClickSend(errorMsg);
             }
         });
     }
 
-
-    // --- DOM Scraping Command Logic ---
-    async function checkForCommandsInTextAndSend(text) { // Made async
-        // Guard Clause: Ensure text is a non-empty string
-        if (!text || typeof text !== 'string') {
-            return;
+    // --- DOM Scraping and Command Parsing Logic (Generic, uses adapter for feedback) ---
+    async function checkForCommandsInTextAndSend(text, uiAdapter) {
+        if (!text || typeof text !== 'string') { return; }
+        if (!uiAdapter || !uiAdapter.injectTextAndClickSend) {
+            GM_log("AGA Controller: checkForCommandsInTextAndSend called without a valid UI adapter for feedback.");
+            // Proceeding without UI feedback capability for errors in this function
         }
 
         const trimmedText = text.trim();
-        const COMMAND_PREFIX_LENGTH = COMMAND_PREFIX.length; // Cache length
-
+        const COMMAND_PREFIX_LENGTH = COMMAND_PREFIX.length;
         let indices = [];
         let currentIndex = trimmedText.indexOf(COMMAND_PREFIX);
         while (currentIndex !== -1) {
@@ -283,178 +407,102 @@
             currentIndex = trimmedText.indexOf(COMMAND_PREFIX, currentIndex + 1);
         }
 
-        if (indices.length === 0) {
-            return; // No AGA:: prefix found
-        }
+        if (indices.length === 0) { return; }
 
         let firstHeuristicParseError = null;
         let firstHeuristicParseErrorJsonString = "";
-        let uiFeedbackMessage = null; // To store the single message for UI feedback
 
-        // Iterate from the last found AGA:: prefix backwards to the first
         for (let i = indices.length - 1; i >= 0; i--) {
             const commandStartIndex = indices[i];
-            // The potential JSON string starts after "AGA::" and goes to the end of the trimmedText
             const potentialJsonString = trimmedText.substring(commandStartIndex + COMMAND_PREFIX_LENGTH);
             const trimmedPotentialAttempt = potentialJsonString.trim();
             
-            if (!trimmedPotentialAttempt) { // If only whitespace (or empty) after AGA::
-                GM_log('AGA Controller: Empty string after AGA:: at index ' + commandStartIndex + '. Skipping.');
-                continue; // Try the next earlier AGA:: prefix
-            }
+            if (!trimmedPotentialAttempt) { continue; }
 
             let parsedPayload;
             try {
                 parsedPayload = JSON.parse(trimmedPotentialAttempt);
             } catch (e) {
-                // Heuristic: Only consider for UI error if it looks like an attempt at a JSON object.
-                const isLikelyJson = trimmedPotentialAttempt.startsWith('{') && 
-                                    trimmedPotentialAttempt.endsWith('}') && 
-                                    (trimmedPotentialAttempt.includes('command') || trimmedPotentialAttempt.includes('browser_code')) && 
-                                    trimmedPotentialAttempt.includes(':');
-
+                const isLikelyJson = trimmedPotentialAttempt.startsWith('{') && trimmedPotentialAttempt.endsWith('}') && (trimmedPotentialAttempt.includes('command') || trimmedPotentialAttempt.includes('browser_code')) && trimmedPotentialAttempt.includes(':');
                 if (isLikelyJson) {
-                    GM_log('AGA Controller: Failed to parse LIKELY JSON object starting after AGA:: at index ' + commandStartIndex + ': "' + trimmedPotentialAttempt.substring(0, 200) + '". Error: ' + e);
-                    if (!firstHeuristicParseError) { // Store the first such error encountered
+                    GM_log('AGA Controller: Failed to parse LIKELY JSON: "', trimmedPotentialAttempt.substring(0, 200), '". Error: ', e);
+                    if (!firstHeuristicParseError) {
                         firstHeuristicParseError = e;
                         firstHeuristicParseErrorJsonString = trimmedPotentialAttempt;
                     }
                 } else {
-                    GM_log('AGA Controller: Failed to parse text after AGA:: (at index ' + commandStartIndex + ') as JSON (not an obvious JSON object attempt): '+ trimmedPotentialAttempt.substring(0,200) + '. Error: ' + e);
+                     GM_log('AGA Controller: Failed to parse (not likely JSON): ', trimmedPotentialAttempt.substring(0,200), '. Error: ', e);
                 }
-                continue; // Try the next earlier AGA:: prefix
+                continue;
             }
 
-            // Successfully parsed JSON, now validate structure
             if (!parsedPayload || typeof parsedPayload.command !== 'string') {
-                GM_log('AGA Controller: Parsed JSON (from AGA:: at index ' + commandStartIndex + '), but \'command\' field is missing or not a string. Payload: ' + JSON.stringify(parsedPayload) + '. Original: ' + trimmedPotentialAttempt);
-                continue; // Try the next earlier AGA:: prefix
+                GM_log('AGA Controller: Parsed JSON, but \'command\' field is missing/invalid. Payload: ', JSON.stringify(parsedPayload));
+                continue;
             }
 
-            // Handle ::browser_code command specifically
             if (parsedPayload.command === BROWSER_CODE_COMMAND) {
                 if (typeof parsedPayload.stdin !== 'string' || !parsedPayload.stdin.trim()) {
-                    GM_log('AGA Controller: Parsed JSON for ' + BROWSER_CODE_COMMAND + ', but stdin is missing, not a string, or empty. Payload: ' + JSON.stringify(parsedPayload));
-                    showSpinner(); // Show spinner before UI feedback for this error
-                    await injectTextAndClickSend("AGA Error: For " + BROWSER_CODE_COMMAND + ", 'stdin' must contain the JavaScript code to inject.");
-                    hideSpinner(); // Hide spinner after UI feedback
-                    return; // Stop processing, error reported
+                    GM_log('AGA Controller: ', BROWSER_CODE_COMMAND, ' error: stdin missing, not a string, or empty.');
+                    await uiAdapter.injectTextAndClickSend("AGA Error: For " + BROWSER_CODE_COMMAND + ", 'stdin' must contain JavaScript code.");
+                    return;
                 }
-                GM_log('AGA Controller: Valid ' + BROWSER_CODE_COMMAND + ' command. Sending code to agent for injection.');
-                await sendCodeToAgentForInjection(parsedPayload.stdin); // New handling for ::browser_code
-                return; // Command handled (sent for injection)
+                GM_log('AGA Controller: Valid ' + BROWSER_CODE_COMMAND + ' command. Sending code for injection.');
+                await sendCodeToAgentForInjection(parsedPayload.stdin, uiAdapter);
+                return;
             }
 
-
-            // For regular commands (not ::browser_code)
+            // Default stdin to empty string if undefined for regular commands
             if (parsedPayload.stdin === undefined) {
                 parsedPayload.stdin = "";
-            } else if (typeof parsedPayload.stdin !== 'string') {
-                GM_log('AGA Controller: Parsed JSON (from AGA:: at index ' + commandStartIndex + '), command is valid, but stdin is present and not a string: ' + trimmedPotentialAttempt);
-                continue; // Try the next earlier AGA:: prefix
             }
 
-            GM_log('AGA Controller: Valid command payload extracted from AGA:: at index ' + commandStartIndex + ': ' + JSON.stringify(parsedPayload));
-            sendCommandToAgent(parsedPayload); // This function handles its own spinner for agent communication
-            return; // Command found and sent, stop processing further AGA:: occurrences
+            if (typeof parsedPayload.stdin !== 'string') {
+                GM_log('AGA Controller: Parsed JSON, command valid, but stdin is present and not a string: ', trimmedPotentialAttempt);
+                continue;
+            }
+
+            GM_log('AGA Controller: Valid command payload extracted: ', JSON.stringify(parsedPayload));
+            await sendCommandToAgent(parsedPayload, uiAdapter);
+            return;
         }
 
-        // If the loop completes, no valid command was sent.
         if (firstHeuristicParseError) {
-            // No specific stdin error, but a general heuristic parse error was found
-            const errorMessage = "AGA Error: Malformed JSON detected in your command.\\nDetails: " + firstHeuristicParseError.message + 
-                                 "\\nProblematic JSON string: " + firstHeuristicParseErrorJsonString.substring(0, 100) + 
+            const errorMessage = "AGA Error: Malformed JSON detected in your command.\nDetails: " + firstHeuristicParseError.message + 
+                                 "\nProblematic JSON string: " + firstHeuristicParseErrorJsonString.substring(0, 100) + 
                                  (firstHeuristicParseErrorJsonString.length > 100 ? "..." : "");
-            showSpinner();
-            await injectTextAndClickSend(errorMessage);
-            hideSpinner();
+            await uiAdapter.injectTextAndClickSend(errorMessage);
         }
-        // If no command sent and no UI-worthy error stored, function exits silently.
     }
 
-    async function handlePotentialCommandEvent(event) { // Made async
-        // Guard Clause: Validate event and event.detail.text
+    // --- Event Listener for Potential Commands (Generic) ---
+    async function handlePotentialCommandEvent(event) {
         if (!event || !event.detail || typeof event.detail.text !== 'string') {
             GM_log('AGA Controller: Invalid ' + AGA_POTENTIAL_COMMAND_EVENT + '.');
             return;
         }
+        if (!UIManager.currentAdapter) {
+            GM_log('AGA Controller: No current UI adapter to handle command event.');
+            return;
+        }
         GM_log('AGA Controller: Received ' + AGA_POTENTIAL_COMMAND_EVENT + ' with text: "' + event.detail.text.substring(0,100) + '..."');
-        await checkForCommandsInTextAndSend(event.detail.text); // Await if it involves UI feedback for errors
+        await checkForCommandsInTextAndSend(event.detail.text, UIManager.currentAdapter);
     }
-
     document.addEventListener(AGA_POTENTIAL_COMMAND_EVENT, handlePotentialCommandEvent);
 
-    // --- Network Interception Utility Functions ---
-    const isTargetStreamGenerateUrl = (url) => {
-        if (!url) return false;
-        return url.includes(STREAM_GENERATE_URL_SUBSTRING);
-    };
+    // --- INITIALIZATION & Network Interception (Generic Event Dispatch) ---
+    UIManager.selectAdapter(); // Selects and initializes the adapter (which now sets up its own listener for AGA_NETWORK_RESPONSE_EVENT)
 
-    const isTargetRegenerateIconUrl = (url) => {
-        if (!url) return false;
-        return url.includes(REGENERATE_ICON_URL_SUBSTRING);
-    };
-
-    const isTargetBatchExecuteUrl = (url) => {
-        if (!url) return false;
-        return url.includes(BATCH_EXECUTE_URL_SUBSTRING);
-    };
-
-    // --- Network Interception Handlers ---
-    function handleStreamGeneratePostOutcome(isSuccess, status, interceptionType, url) {
-        if (!isSuccess) {
-            GM_log('AGA Controller: ' + interceptionType + ' POST not successful. Status: ' + status + '. URL: ' + url + '.');
-            return;
-        }
-        if (isCalmDownPeriodActive) {
-            GM_log('AGA Controller: ' + interceptionType + ' POST occurred during calm down period. Ignoring. URL: ' + url);
-            return;
-        }
-        GM_log('AGA Controller: ' + interceptionType + ' POST successful. Waiting for RegenerateIcon. URL: ' + url);
-        isWaitingForRegenerateIconResponse = true;
+    if (!UIManager.currentAdapter) {
+        GM_log("AGA Controller: No suitable UI adapter found. Cannot initialize network interceptors.");
+        return; // Exit early if no adapter is selected
     }
+    GM_log("AGA Controller: Adapter selected: " + UIManager.currentAdapter.name + ". Initializing generic network interceptors.");
 
-    function handleRegenerateIconGet(interceptedUrl, interceptionType) {
-        GM_log('AGA Controller: Intercepted ' + interceptionType + ' GET to RegenerateIcon: ' + interceptedUrl + '. Waiting: ' + isWaitingForRegenerateIconResponse);
-        
-        if (!isWaitingForRegenerateIconResponse) {
-            GM_log('AGA Controller: RegenerateIcon GET, but not waiting. Ignoring.');
-            return;
-        }
-
-        GM_log('AGA Controller: RegenerateIcon GET while waiting. Condition met to execute injected code.');
-        isWaitingForRegenerateIconResponse = false; // Reset state immediately
-
-        // Execute the dynamically injected code
-        if(!window.injectionExecuted) {
-            executeDynamicallyInjectedBrowserCode();
-            window.injectionExecuted = true; // Prevent re-execution
-        }
-
-        const messageElements = document.querySelectorAll(MESSAGE_CONTENT_SELECTOR);
-        if (messageElements.length === 0) {
-            GM_log('AGA Controller: RegenerateIcon trigger, but no <' + MESSAGE_CONTENT_SELECTOR + '> elements found.');
-        } else {
-            const lastMessageElement = messageElements[messageElements.length - 1];
-            const messageText = lastMessageElement.textContent || "";
-            let logText = messageText.substring(0, 100) + (messageText.length > 100 ? "..." : "");
-            GM_log('AGA Controller: Text from <' + MESSAGE_CONTENT_SELECTOR + '>: "' + logText + '"');
-            document.dispatchEvent(new CustomEvent(AGA_POTENTIAL_COMMAND_EVENT, { detail: { text: messageText } }));
-        }
-
-        isCalmDownPeriodActive = true;
-        GM_log('AGA Controller: Calm down period activated for ' + CALM_DOWN_DURATION_MS + 'ms.');
-        setTimeout(() => {
-            isCalmDownPeriodActive = false;
-            GM_log("AGA Controller: Calm down period ended.");
-        }, CALM_DOWN_DURATION_MS);
-    }
-
-    // --- Network Interception Overrides ---
     const originalXhrOpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function(method, url) {
         this._aga_method = method;
-        this._aga_url = url;
+        this._aga_url = String(url); // Ensure URL is a string
         return originalXhrOpen.apply(this, arguments);
     };
 
@@ -464,67 +512,56 @@
         const method = xhr._aga_method;
         const url = xhr._aga_url;
 
-        if (method === 'POST' && (isTargetStreamGenerateUrl(url) || isTargetBatchExecuteUrl(url))) {
-            let requestType = isTargetStreamGenerateUrl(url) ? "StreamGenerate" : "BatchExecute";
-            GM_log('AGA Controller: XHR ' + requestType + ' POST: ' + url);
-            const originalOnLoad = xhr.onload;
-            xhr.onload = function() {
-                handleStreamGeneratePostOutcome(xhr.status === 200, xhr.status, 'XHR ' + requestType, url);
-                if (originalOnLoad) originalOnLoad.apply(this, arguments);
-            };
-        } else if (method === 'GET' && isTargetRegenerateIconUrl(url)) {
-             const originalOnLoad = xhr.onload;
-             xhr.onload = function() {
-                if (xhr.status === 200) {
-                    handleRegenerateIconGet(url, "XHR");
-                } else {
-                    GM_log('AGA Controller: XHR RegenerateIcon GET to ' + url + ' not successful (Status: ' + xhr.status + ').');
-                    if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
-                }
-                if (originalOnLoad) originalOnLoad.apply(this, arguments);
-            };
-        }
+        const dispatchNetworkEvent = (status, error = false, errorMessage = "") => {
+            document.dispatchEvent(new CustomEvent(AGA_NETWORK_RESPONSE_EVENT, {
+                detail: { method: method, url: url, status: status, error: error, errorMessage: errorMessage }
+            }));
+        };
+
+        const originalOnLoad = xhr.onload;
+        xhr.onload = function() {
+            dispatchNetworkEvent(xhr.status);
+            if (originalOnLoad) originalOnLoad.apply(this, arguments);
+        };
+        const originalOnError = xhr.onerror;
+        xhr.onerror = function() { // Report XHR errors as status 0 or specific error code if available
+            dispatchNetworkEvent(xhr.status || 0, true, "XHR Error");
+            if (originalOnError) originalOnError.apply(this, arguments);
+        };
+        const originalOnTimeout = xhr.ontimeout;
+        xhr.ontimeout = function() {
+            dispatchNetworkEvent(xhr.status || 0, true, "XHR Timeout");
+            if (originalOnTimeout) originalOnTimeout.apply(this, arguments);
+        };
+
         return originalXhrSend.apply(this, arguments);
     };
 
     const originalFetch = window.fetch;
     window.fetch = async function(input, init) {
-        const requestUrl = typeof input === 'string' ? input : input.url;
+        const requestUrl = typeof input === 'string' ? input : (input instanceof URL ? input.href : (input && input.url ? input.url : String(input)));
         const requestMethod = init?.method?.toUpperCase() || (typeof input === 'object' && input.method?.toUpperCase()) || 'GET';
-
-        if (requestMethod === 'POST' && (isTargetStreamGenerateUrl(requestUrl) || isTargetBatchExecuteUrl(requestUrl))) {
-            let requestType = isTargetStreamGenerateUrl(requestUrl) ? "StreamGenerate" : "BatchExecute";
-            GM_log('AGA Controller: Fetch ' + requestType + ' POST: ' + requestUrl);
-            try {
-                const response = await originalFetch(input, init);
-                handleStreamGeneratePostOutcome(response.ok, response.status, 'Fetch ' + requestType, requestUrl);
-                return response;
-            } catch (error) {
-                GM_log('AGA Controller: Fetch ' + requestType + ' POST error: ' + error + '. URL: ' + requestUrl);
-                if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
-                throw error;
-            }
-        } else if (requestMethod === 'GET' && isTargetRegenerateIconUrl(requestUrl)) {
-            GM_log('AGA Controller: Fetch RegenerateIcon GET: ' + requestUrl);
-            try {
-                const response = await originalFetch(input, init);
-                if (response.ok) {
-                    handleRegenerateIconGet(requestUrl, "Fetch");
-                } else {
-                     GM_log('AGA Controller: Fetch RegenerateIcon GET to ' + requestUrl + ' not successful (Status: ' + response.status + ').');
-                     if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
-                }
-                return response;
-            } catch (error) {
-                GM_log('AGA Controller: Fetch RegenerateIcon GET error: ' + error + '. URL: ' + requestUrl);
-                if(isWaitingForRegenerateIconResponse) isWaitingForRegenerateIconResponse = false;
-                throw error;
-            }
+        
+        try {
+            const response = await originalFetch(input, init);
+            document.dispatchEvent(new CustomEvent(AGA_NETWORK_RESPONSE_EVENT, {
+                detail: { method: requestMethod, url: requestUrl, status: response.status }
+            }));
+            return response;
+        } catch (error) {
+            document.dispatchEvent(new CustomEvent(AGA_NETWORK_RESPONSE_EVENT, {
+                detail: { method: requestMethod, url: requestUrl, status: 0, error: true, errorMessage: error.message }
+            }));
+            GM_log(`AGA Controller: Fetch error for ${requestUrl}: ${error}`);
+            throw error;
         }
-        return originalFetch(input, init);
     };
-
-    // --- Initialization ---
-    GM_log("AGA Controller (v3.1): Network interceptors initialized. Agent URL: " + AGENT_URL + ", Inject URL: " + AGENT_INJECT_CODE_URL);
-
+    GM_log(`AGA Controller (Event-Driven Refactor): Initialized with ${UIManager.currentAdapter.name} adapter. Agent URL: ${AGENT_URL}, Inject URL: ${AGENT_INJECT_CODE_URL}`);
+    
+    // Execute dynamically injected code if any (this is generic)
+    // This should run after adapter initialization in case injected code relies on adapter setup.
+    if(!window.injectionExecuted) {
+        executeDynamicallyInjectedBrowserCode();
+        window.injectionExecuted = true;
+    }
 })();
