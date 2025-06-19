@@ -5,12 +5,22 @@ import shlex
 from fastapi.responses import FileResponse, JSONResponse 
 import os
 import re # Make sure re is imported
+import base64
+import tempfile
+import codecs
+from email import message_from_string
+from email.policy import default as email_default_policy
+from email.message import EmailMessage
+from email.header import decode_header
+from email import message_from_bytes
+from email.mime.text import MIMEText
 
 app = FastAPI()
 
 class CommandRequest(BaseModel):
     command: str
-    stdin: str | None = "" # Add stdin field, default to empty string if not provided
+    stdin: str | None = ""
+    # script_content and encoded_type removed; use stdin and encoding prefix
 
 class CommandResponse(BaseModel):
     stdout: str
@@ -38,6 +48,67 @@ async def execute_command(request: CommandRequest):
         if request.stdin is not None and not isinstance(request.stdin, str):
             raise HTTPException(status_code=400, detail="stdin must be a string if provided.")
 
+        # --- New: run_python command ---
+        if request.command == "run_python_mime":
+            # Guard Clause: Check for stdin
+            if not request.stdin or not isinstance(request.stdin, str):
+                raise HTTPException(status_code=400, detail="Missing or invalid stdin for run_python_mime.")
+            try:
+                # If the input does not contain Content-Type, add a default Content-Type and Content-Transfer-Encoding
+                if not re.search(r'^content-type:', request.stdin, re.IGNORECASE):
+                    # Default to text/plain and 7bit encoding
+                    mime_string = f"Content-Type: text/plain; charset=utf-8\nContent-Transfer-Encoding: 7bit\n\n{request.stdin}"
+                else:
+                    mime_string = request.stdin
+                # Parse the MIME message
+                msg = message_from_string(mime_string, policy=email_default_policy)
+                # Use the email library to decode the payload according to Content-Transfer-Encoding
+                if msg.is_multipart():
+                    decoded_script = "".join(part.get_content() for part in msg.iter_parts())
+                else:
+                    decoded_script = msg.get_content()
+                # Sanitize: replace all non-breaking spaces with standard spaces
+                decoded_script = decoded_script.replace('\xa0', ' ')
+            except Exception as e:
+                return CommandResponse(
+                    command=request.command,
+                    stdin=request.stdin,
+                    stdout="",
+                    stderr=f"Failed to parse/decode MIME script: {e}",
+                    return_code=1
+                )
+            # Force: Always use the temporary file fallback method
+            try:
+                with tempfile.NamedTemporaryFile("w", suffix=".py", delete=False) as tmpf:
+                    tmpf.write(decoded_script)
+                    tmpf_path = tmpf.name
+                process = subprocess.run(
+                    ["python", tmpf_path],
+                    capture_output=True,
+                    text=True,
+                    shell=False
+                )
+                os.unlink(tmpf_path)
+                return CommandResponse(
+                    command=request.command,
+                    stdin=decoded_script,
+                    stdout=process.stdout,
+                    stderr=process.stderr,
+                    return_code=process.returncode
+                )
+            except Exception as e2:
+                # Always use process.stdout if process exists, else empty string
+                stdout = process.stdout if 'process' in locals() and hasattr(process, 'stdout') else ""
+                stderr = process.stderr if 'process' in locals() and hasattr(process, 'stderr') else f"Failed to execute Python script via temp file: {e2}"
+                return_code = process.returncode if 'process' in locals() and hasattr(process, 'returncode') else 1
+                return CommandResponse(
+                    command=request.command,
+                    stdin=decoded_script,
+                    stdout=stdout,
+                    stderr=stderr,
+                    return_code=return_code
+                )
+        
         # Main logic proceeds if guard clauses are passed
         process_input = request.stdin # Will be None if request.stdin was None, or the string value
 

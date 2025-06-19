@@ -61,12 +61,34 @@ A command's journey begins in an LLM's web UI (e.g., Gemini, AI Studio).
 *   **Local Agent (Python):**
     *   **Framework:** Built with FastAPI. Pydantic models (`CommandRequest`, `CommandResponse`, `InjectCodeRequest`) ensure data validation.
     *   **Execution (Shell Commands):** The `POST /command` endpoint uses Python's `subprocess` module to run shell commands.
+    *   **Python Script Execution (`run_python`):**
+        *   The `POST /command` endpoint also supports a special `run_python` command for executing Python scripts.
+        *   Accepts a payload with `{"command": "run_python", "script_content": "...", "encoded_type": "base64"|"plain"}`.
+        *   If `encoded_type` is `base64`, the script is base64-decoded; if `plain`, the script is used as-is.
+        *   The script is executed in-memory if possible, or via a temporary file as fallback.
+        *   Returns `stdout`, `stderr`, and `return_code` in the response.
+        *   Robust error handling for decoding and execution errors.
+    *   **Python Script Execution (`run_python_mime`):**
+        *   The `POST /command` endpoint supports a special `run_python_mime` command for executing Python scripts sent as MIME messages.
+        *   Accepts a payload with `{"command": "run_python_mime", "stdin": "<MIME_message>"}`.
+        *   The `stdin` field must be a valid MIME message, with standard headers such as `Content-Type: text/plain; charset=utf-8` and `Content-Transfer-Encoding: base64` (or `7bit`, `quoted-printable`, etc.).
+        *   If headers are missing, defaults to `text/plain; charset=utf-8` and `7bit` encoding.
+        *   The script is extracted and decoded according to the MIME headers using the Python `email` library, then executed.
+        *   Returns `stdout`, `stderr`, and `return_code` in the response.
+        *   Robust error handling for MIME parsing, decoding, and execution errors.
+        *   **Example:**
+            ```
+            Content-Type: text/plain; charset=utf-8
+            Content-Transfer-Encoding: base64
+            
+            aW1wb3J0IHN5cwppbnQoc3lzLmFyZ3YpCg==
+            ```
     *   **Code Injection (`::browser_code`):**
         *   The `POST /inject_code` endpoint receives JavaScript code.
         *   It reads `browser_controller.user.js`, replaces content between the injection markers, and **increments the `@version` number** in the script's header.
         *   Saves the modified file and returns a success/failure message.
     *   **API Contract:**
-        *   `POST /command`: Expects `{"command": "string", "stdin": "string_or_null_or_omitted"}`.
+        *   `POST /command`: Expects `{"command": "string", "stdin": "string_or_null_or_omitted"}` for shell commands, or `{"command": "run_python_mime", "stdin": "<MIME_message>"}` for Python scripts as MIME (with standard headers).
         *   `POST /inject_code`: Expects `{"code_to_inject": "string_javascript_code"}`.
         *   `GET /browser_controller.user.js`: Serves the `browser_controller.user.js` file, enabling Tampermonkey's update mechanism.
     *   **Error Handling:** Uses FastAPI's `HTTPException`.
